@@ -1,6 +1,13 @@
 """
 Mairui Data Provider for A-Share Stocks
 Provides real-time quotes and K-line data via Mairui API
+
+API Documentation: https://www.mairuiapi.com/hsdata
+
+Key Endpoints:
+- Stock list: /hslt/list/{licence}
+- Realtime quote: /hsrl/ssjy/{code}/{licence}  (code = 6-digit, no suffix)
+- K-line data: /hsstock/history/{code}.{market}/{period}/{adj}/{licence}?lt={count}
 """
 
 import os
@@ -13,27 +20,29 @@ from datetime import datetime
 class MairuiProvider:
     """
     Mairui Data Provider for A-Share stocks
-    API Documentation: https://api.mairuiapi.com
+    API Documentation: https://www.mairuiapi.com/hsdata
     """
     
     BASE_URL = "https://api.mairuiapi.com"
     
-    # Map friendly period names to Mairui API klt values
+    # Map friendly period names to Mairui API period codes for /hsstock/history/
     PERIOD_MAP = {
-        # Minute bars
-        '1m': '1',
+        # Minute bars: 5, 15, 30, 60
+        '1m': '5',     # 1 minute -> 5 minutes (Mairui minimum is 5m)
         '5m': '5',
         '15m': '15',
         '30m': '30',
         '60m': '60',
-        # Daily/Weekly/Monthly
-        'day': '101',
-        'daily': '101',
-        '1d': '101',
-        'week': '102',
-        'weekly': '102',
-        'month': '103',
-        'monthly': '103',
+        # Daily/Weekly/Monthly/Yearly
+        'day': 'd',
+        'daily': 'd',
+        '1d': 'd',
+        'week': 'w',
+        'weekly': 'w',
+        'month': 'm',
+        'monthly': 'm',
+        'year': 'y',
+        'yearly': 'y',
     }
     
     def __init__(self, licence: Optional[str] = None):
@@ -51,26 +60,18 @@ class MairuiProvider:
         
         self.licence = licence
     
-    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict]:
+    def _make_request(self, url: str) -> Optional[Any]:
         """
         Make HTTP GET request to Mairui API
         
         Args:
-            endpoint: API endpoint path
-            params: Query parameters (licence will be added automatically)
+            url: Full URL for the request
             
         Returns:
-            JSON response as dict or None on error
+            JSON response or None on error
         """
-        url = f"{self.BASE_URL}{endpoint}"
-        
-        if params is None:
-            params = {}
-        
-        params['licence'] = self.licence
-        
         try:
-            response = requests.get(url, params=params, timeout=30)
+            response = requests.get(url, timeout=30, headers={'User-Agent': 'Mozilla/5.0'})
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
@@ -80,15 +81,15 @@ class MairuiProvider:
             print(f"Mairui API JSON parse error: {e}")
             return None
     
-    def _normalize_symbol(self, symbol: str) -> str:
+    def _normalize_symbol_for_realtime(self, symbol: str) -> str:
         """
-        Normalize symbol to 6-digit format
+        Normalize symbol for realtime API (6-digit code only)
         
         Args:
             symbol: Stock symbol (e.g., '000001', '000001.SH', 'SH000001')
             
         Returns:
-            Normalized 6-digit symbol
+            6-digit code without exchange suffix
         """
         symbol = symbol.strip().upper()
         
@@ -100,69 +101,92 @@ class MairuiProvider:
         
         # Remove exchange prefixes
         for prefix in ['SZ', 'SH', 'BJ']:
-            if symbol.startswith(prefix):
+            if symbol.startswith(prefix) and len(symbol) == 8:
                 symbol = symbol[len(prefix):]
                 break
         
         # Pad to 6 digits
-        symbol = symbol.zfill(6)
-        
-        return symbol
+        return symbol.zfill(6)
     
-    def _to_float(self, value: Any) -> Optional[float]:
+    def _normalize_symbol_for_kline(self, symbol: str) -> str:
         """
-        Safe float conversion
+        Normalize symbol for K-line API (code.market format)
         
         Args:
-            value: Value to convert
+            symbol: Stock symbol (e.g., '000001', '000001.SH', 'SH000001')
             
         Returns:
-            Float value or None on conversion error
+            Symbol in format like '000001.SZ' or '600519.SH'
         """
+        symbol = symbol.strip().upper()
+        
+        exchange = ''
+        code = symbol
+        
+        # Remove exchange suffixes
+        for suffix in ['.SZ', '.SH', '.BJ', '.SHANGHAI', '.BEIJING']:
+            if symbol.endswith(suffix):
+                exchange = symbol[-2:].upper()
+                code = symbol[:-3]
+                break
+        
+        # Handle prefixes like SZ000001 or SH600519
+        if not exchange:
+            for prefix in ['SZ', 'SH', 'BJ']:
+                if symbol.startswith(prefix) and len(symbol) == 8:
+                    exchange = prefix
+                    code = symbol[2:]
+                    break
+        
+        # Pad to 6 digits
+        code = code.zfill(6)
+        
+        # Default to SZ for codes starting with 0, 1, 3
+        # Default to SH for codes starting with 6, 9
+        if not exchange:
+            if code.startswith(('0', '1', '3')):
+                exchange = 'SZ'
+            else:
+                exchange = 'SH'
+        
+        return f"{code}.{exchange}"
+    
+    def _to_float(self, value: Any) -> Optional[float]:
+        """Safe float conversion"""
         if value is None:
             return None
-        
         try:
             return float(value)
         except (ValueError, TypeError):
             return None
     
-    def _parse_quote(self, data: Dict) -> Dict[str, Any]:
-        """
-        Parse Mairui API quote response to standardized dict
-        
-        Args:
-            data: Raw API response dict
-            
-        Returns:
-            Standardized quote dictionary
-        """
+    def _parse_realtime_quote(self, data: Dict) -> Dict[str, Any]:
+        """Parse realtime quote response to standardized dict"""
         if not data:
             return {}
         
         return {
             'name': data.get('name', ''),
             'symbol': data.get('code', ''),
-            'price': self._to_float(data.get('price')),
-            'change': self._to_float(data.get('zd', 0)),
-            'change_percent': self._to_float(data.get('zdf', 0)),
-            'volume': self._to_float(data.get('vol', 0)),
-            'open': self._to_float(data.get('open', 0)),
-            'high': self._to_float(data.get('high', 0)),
-            'low': self._to_float(data.get('low', 0)),
-            'pre_close': self._to_float(data.get('pcls', 0)),
+            'price': self._to_float(data.get('p')),
+            'change': self._to_float(data.get('ud')),
+            'change_percent': self._to_float(data.get('pc')),
+            'volume': self._to_float(data.get('v')),
+            'open': self._to_float(data.get('o')),
+            'high': self._to_float(data.get('h')),
+            'low': self._to_float(data.get('l')),
+            'pre_close': self._to_float(data.get('yc')),
+            'amount': self._to_float(data.get('cje')),
+            'turnover_rate': self._to_float(data.get('hs')),
+            'pe_ratio': self._to_float(data.get('pe')),
+            'total_market_cap': self._to_float(data.get('sz')),
+            'float_market_cap': self._to_float(data.get('lt')),
+            'amplitude': self._to_float(data.get('zf')),
+            'timestamp': data.get('t', ''),
         }
     
     def _parse_kline(self, data: list) -> pd.DataFrame:
-        """
-        Parse Mairui API K-line response to DataFrame
-        
-        Args:
-            data: Raw API response list
-            
-        Returns:
-            DataFrame with columns: date(index), open, close, high, low, volume
-        """
+        """Parse K-line response to DataFrame"""
         if not data or not isinstance(data, list):
             return pd.DataFrame()
         
@@ -170,12 +194,14 @@ class MairuiProvider:
         for item in data:
             if isinstance(item, dict):
                 records.append({
-                    'date': item.get('date', ''),
-                    'open': self._to_float(item.get('open', 0)),
-                    'close': self._to_float(item.get('close', 0)),
-                    'high': self._to_float(item.get('high', 0)),
-                    'low': self._to_float(item.get('low', 0)),
-                    'volume': self._to_float(item.get('vol', 0)),
+                    'date': item.get('t', ''),
+                    'open': self._to_float(item.get('o', 0)),
+                    'close': self._to_float(item.get('c', 0)),
+                    'high': self._to_float(item.get('h', 0)),
+                    'low': self._to_float(item.get('l', 0)),
+                    'volume': self._to_float(item.get('v', 0)),
+                    'amount': self._to_float(item.get('a', 0)),
+                    'pre_close': self._to_float(item.get('pc', 0)),
                 })
         
         if not records:
@@ -193,20 +219,20 @@ class MairuiProvider:
         Get real-time quote data
         
         Args:
-            symbol: Stock symbol (6-digit or with prefix)
+            symbol: Stock symbol (6-digit or with prefix/suffix)
             
         Returns:
             Dictionary with real-time quote data or None
         """
-        symbol = self._normalize_symbol(symbol)
+        code = self._normalize_symbol_for_realtime(symbol)
+        url = f"{self.BASE_URL}/hsrl/ssjy/{code}/{self.licence}"
         
-        endpoint = f"/hsrl/ssgs/{symbol}"
-        data = self._make_request(endpoint)
+        data = self._make_request(url)
         
-        if data is None:
+        if data is None or isinstance(data, dict) and 'detail' in data:
             return None
         
-        return self._parse_quote(data)
+        return self._parse_realtime_quote(data)
     
     def get_kline(
         self,
@@ -214,34 +240,54 @@ class MairuiProvider:
         period: str = "day",
         count: int = 120,
         start_date: Optional[str] = None,
-        end_date: Optional[str] = None
+        end_date: Optional[str] = None,
+        adjust: str = "none"  # none, forward, backward
     ) -> Optional[pd.DataFrame]:
         """
         Get K-line data
         
         Args:
-            symbol: Stock symbol (6-digit or with prefix)
-            period: K-line period ('1m', '5m', '15m', '30m', '60m', 'day', 'week', 'month')
-            count: Number of records to retrieve
-            start_date: Start date (YYYY-MM-DD), not used in Mairui API
-            end_date: End date (YYYY-MM-DD), not used in Mairui API
+            symbol: Stock symbol (6-digit or with prefix/suffix)
+            period: K-line period ('1m', '5m', '15m', '30m', '60m', 'day', 'week', 'month', 'year')
+            count: Number of records to retrieve (max 5 for minute bars, more for daily+)
+            start_date: Start date (YYYY-MM-DD) - optional
+            end_date: End date (YYYY-MM-DD) - optional
+            adjust: Price adjustment ('none', 'forward', 'backward')
             
         Returns:
             DataFrame with columns: date(index), open, close, high, low, volume or None
         """
-        symbol = self._normalize_symbol(symbol)
+        symbol_market = self._normalize_symbol_for_kline(symbol)
         period = period.lower()
         
         # Get Mairui period code
         mairui_period = self.PERIOD_MAP.get(period)
         if mairui_period is None:
             print(f"Unsupported period: {period}, using 'day'")
-            mairui_period = '101'
+            mairui_period = 'd'
         
-        endpoint = f"/hslt/kline/{symbol}"
-        params = {'klt': mairui_period}
+        # Get adjustment code
+        adj_map = {'none': 'n', 'forward': 'f', 'backward': 'b', 'fr': 'fr', 'br': 'br'}
+        mairui_adj = adj_map.get(adjust.lower(), 'n')
         
-        data = self._make_request(endpoint, params)
+        # Build URL: /hsstock/history/{code}.{market}/{period}/{adj}/{licence}
+        url = f"{self.BASE_URL}/hsstock/history/{symbol_market}/{mairui_period}/{mairui_adj}/{self.licence}"
+        
+        # Add query parameters
+        params = []
+        if count:
+            params.append(f"lt={min(count, 100)}")  # Limit max to 100
+        if start_date:
+            start_str = start_date.replace('-', '')
+            params.append(f"st={start_str}")
+        if end_date:
+            end_str = end_date.replace('-', '')
+            params.append(f"et={end_str}")
+        
+        if params:
+            url += "?" + "&".join(params)
+        
+        data = self._make_request(url)
         
         if data is None or not isinstance(data, list):
             return None
@@ -254,11 +300,32 @@ class MairuiProvider:
         
         return df
     
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """
+        Get list of all A-share stocks
+        
+        Returns:
+            DataFrame with columns: dm (code), mc (name), jys (exchange)
+        """
+        url = f"{self.BASE_URL}/hslt/list/{self.licence}"
+        
+        data = self._make_request(url)
+        
+        if data is None or not isinstance(data, list):
+            return None
+        
+        if not data:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(data)
+        if 'dm' in df.columns:
+            df = df.rename(columns={'dm': 'code', 'mc': 'name', 'jys': 'exchange'})
+        
+        return df
+    
     def get_fundamental_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        Get fundamental data
-        Note: Mairui API doesn't provide detailed fundamental data
-        Returns basic info from real-time quote
+        Get fundamental data from realtime quote
         
         Args:
             symbol: Stock symbol
@@ -274,22 +341,16 @@ class MairuiProvider:
         return {
             'symbol': symbol,
             'name': quote.get('name', ''),
-            'market_cap': None,  # Not available in Mairui API
-            'pe_ratio': None,
-            'pb_ratio': None,
-            'dividend_yield': None,
-            'eps': None,
-            'source': 'mairui_basic'
+            'market_cap': quote.get('total_market_cap'),
+            'float_market_cap': quote.get('float_market_cap'),
+            'pe_ratio': quote.get('pe_ratio'),
+            'turnover_rate': quote.get('turnover_rate'),
+            'source': 'mairui_realtime'
         }
 
 
 def get_mairui_provider() -> MairuiProvider:
-    """
-    Convenience function to create MairuiProvider instance
-    
-    Returns:
-        MairuiProvider instance
-    """
+    """Convenience function to create MairuiProvider instance"""
     return MairuiProvider()
 
 
@@ -302,60 +363,59 @@ if __name__ == "__main__":
     # Check if licence is available
     licence = os.environ.get('MAIRUI_LICENCE')
     if not licence:
-        print("WARNING: MAIRUI_LICENCE env var not set")
-        print("Set it with: export MAIRUI_LICENCE=your_licence_key")
-        print("Using placeholder for testing...")
-        # Use a test licence for demonstration
-        licence = "TEST_LICENCE"
+        print("Using provided test licence...")
+        licence = "BDF90534-E1FD-4F16-9CD4-B8F9275AE19F"
     
     try:
         provider = MairuiProvider(licence)
         
-        # Test with a known A-share stock
-        test_symbol = "000001"  # 平安银行
+        # Test with known A-share stocks
+        test_symbols = ["000001", "600519"]  # 平安银行, 贵州茅台
         
-        print(f"\n1. Testing get_realtime_quote for {test_symbol}")
-        quote = provider.get_realtime_quote(test_symbol)
-        if quote:
-            print(f"  Name: {quote.get('name')}")
-            print(f"  Price: {quote.get('price')}")
-            print(f"  Change: {quote.get('change')} ({quote.get('change_percent')}%)")
-            print(f"  High/Low: {quote.get('high')}/{quote.get('low')}")
-            print(f"  Volume: {quote.get('volume')}")
-        else:
-            print("  Failed to get real-time quote (check licence/API)")
+        for test_symbol in test_symbols:
+            print(f"\n{'='*50}")
+            print(f"Testing {test_symbol}")
+            print(f"{'='*50}")
+            
+            print(f"\n1. Testing get_realtime_quote")
+            quote = provider.get_realtime_quote(test_symbol)
+            if quote:
+                print(f"  Name: {quote.get('name')}")
+                print(f"  Symbol: {quote.get('symbol')}")
+                print(f"  Price: {quote.get('price')}")
+                print(f"  Change: {quote.get('change')} ({quote.get('change_percent')}%)")
+                print(f"  High/Low: {quote.get('high')}/{quote.get('low')}")
+                print(f"  Volume: {quote.get('volume')}")
+                print(f"  Amount: {quote.get('amount')}")
+                print(f"  PE: {quote.get('pe_ratio')}")
+            else:
+                print("  Failed to get real-time quote")
+            
+            print(f"\n2. Testing get_kline (day, count=5)")
+            df = provider.get_kline(test_symbol, period="day", count=5)
+            if df is not None and not df.empty:
+                print(f"  Retrieved {len(df)} records")
+                print(df.tail())
+            else:
+                print("  Failed to get K-line data")
+            
+            print(f"\n3. Testing get_kline (week, count=3)")
+            df = provider.get_kline(test_symbol, period="week", count=3)
+            if df is not None and not df.empty:
+                print(f"  Retrieved {len(df)} records")
+                print(df.tail())
+            else:
+                print("  Failed to get weekly K-line data")
         
-        print(f"\n2. Testing get_kline for {test_symbol} (day)")
-        df = provider.get_kline(test_symbol, period="day", count=5)
+        print(f"\n{'='*50}")
+        print("Testing get_stock_list")
+        print(f"{'='*50}")
+        df = provider.get_stock_list()
         if df is not None and not df.empty:
-            print(f"  Retrieved {len(df)} records")
-            print(df.tail())
+            print(f"  Retrieved {len(df)} stocks")
+            print(df.head())
         else:
-            print("  Failed to get K-line data (check licence/API)")
-        
-        print(f"\n3. Testing get_kline for {test_symbol} (week)")
-        df = provider.get_kline(test_symbol, period="week", count=3)
-        if df is not None and not df.empty:
-            print(f"  Retrieved {len(df)} records")
-            print(df.tail())
-        else:
-            print("  Failed to get weekly K-line data")
-        
-        print(f"\n4. Testing get_kline for {test_symbol} (1m)")
-        df = provider.get_kline(test_symbol, period="1m", count=5)
-        if df is not None and not df.empty:
-            print(f"  Retrieved {len(df)} records")
-            print(df.tail())
-        else:
-            print("  Failed to get minute K-line data")
-        
-        print(f"\n5. Testing get_fundamental_data for {test_symbol}")
-        fundamental = provider.get_fundamental_data(test_symbol)
-        if fundamental:
-            print(f"  Name: {fundamental.get('name')}")
-            print(f"  Source: {fundamental.get('source')}")
-        else:
-            print("  Failed to get fundamental data")
+            print("  Failed to get stock list")
         
         print("\n" + "=" * 60)
         print("MairuiProvider test complete")
@@ -363,6 +423,5 @@ if __name__ == "__main__":
         
     except ValueError as e:
         print(f"\nError: {e}")
-        print("Please set MAIRUI_LICENCE environment variable with your API licence")
     except Exception as e:
         print(f"\nUnexpected error: {e}")
