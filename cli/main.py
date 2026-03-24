@@ -1273,6 +1273,10 @@ def run_analysis_cn(
     config["a_share_data_source"] = source
     config["a_share_enabled"] = True
 
+    # Override recursion limit from environment
+    if os.getenv("MAX_RECUR_LIMIT"):
+        config["max_recur_limit"] = int(os.getenv("MAX_RECUR_LIMIT"))
+
     # Override LLM config from environment (supports non-OpenAI providers)
     if os.getenv("LLM_PROVIDER"):
         config["llm_provider"] = os.getenv("LLM_PROVIDER")

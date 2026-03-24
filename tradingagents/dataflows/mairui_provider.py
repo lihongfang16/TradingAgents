@@ -59,6 +59,7 @@ class MairuiProvider:
             raise ValueError("Mairui licence not provided and MAIRUI_LICENCE env var not set")
         
         self.licence = licence
+        self._stock_list_cache = None  # Lazy-loaded stock list cache
     
     def _make_request(self, url: str) -> Optional[Any]:
         """
@@ -107,7 +108,31 @@ class MairuiProvider:
         
         # Pad to 6 digits
         return symbol.zfill(6)
-    
+
+    def _get_stock_name(self, code: str) -> str:
+        """
+        Get stock name from stock list cache
+        
+        Args:
+            code: 6-digit stock code
+            
+        Returns:
+            Stock name or empty string if not found
+        """
+        # Normalize code
+        normalized = code.strip().upper()
+        
+        # Check cache
+        if self._stock_list_cache is not None:
+            # Try with .SZ first (most common for 002xxx codes)
+            for suffix in ['.SZ', '.SH']:
+                test_code = normalized + suffix if not normalized.endswith(suffix) else normalized
+                match = self._stock_list_cache[self._stock_list_cache['code'] == test_code]
+                if not match.empty:
+                    return match.iloc[0]['name']
+        
+        return ''
+
     def _normalize_symbol_for_kline(self, symbol: str) -> str:
         """
         Normalize symbol for K-line API (code.market format)
@@ -160,14 +185,24 @@ class MairuiProvider:
         except (ValueError, TypeError):
             return None
     
-    def _parse_realtime_quote(self, data: Dict) -> Dict[str, Any]:
+    def _parse_realtime_quote(self, data: Dict, raw_code: str = '') -> Dict[str, Any]:
         """Parse realtime quote response to standardized dict"""
         if not data:
             return {}
         
+        # Look up company name from stock list if not in response
+        name = data.get('name', '')
+        if not name and raw_code:
+            name = self._get_stock_name(raw_code)
+        
+        # Look up symbol from stock list if not in response
+        symbol = data.get('code', '')
+        if not symbol and raw_code:
+            symbol = raw_code
+        
         return {
-            'name': data.get('name', ''),
-            'symbol': data.get('code', ''),
+            'name': name,
+            'symbol': symbol,
             'price': self._to_float(data.get('p')),
             'change': self._to_float(data.get('ud')),
             'change_percent': self._to_float(data.get('pc')),
@@ -232,7 +267,12 @@ class MairuiProvider:
         if data is None or isinstance(data, dict) and 'detail' in data:
             return None
         
-        return self._parse_realtime_quote(data)
+        # Get name from stock list for display
+        stock_name = self._get_stock_name(code)
+        if stock_name:
+            data['name'] = stock_name
+        data['code'] = code
+        return self._parse_realtime_quote(data, code)
     
     def get_kline(
         self,
@@ -307,6 +347,10 @@ class MairuiProvider:
         Returns:
             DataFrame with columns: dm (code), mc (name), jys (exchange)
         """
+        # Return cache if available
+        if self._stock_list_cache is not None:
+            return self._stock_list_cache
+        
         url = f"{self.BASE_URL}/hslt/list/{self.licence}"
         
         data = self._make_request(url)
@@ -320,6 +364,12 @@ class MairuiProvider:
         df = pd.DataFrame(data)
         if 'dm' in df.columns:
             df = df.rename(columns={'dm': 'code', 'mc': 'name', 'jys': 'exchange'})
+        
+        # Note: dm field already contains full code with suffix (e.g., '000001.SZ')
+        # No additional normalization needed
+        
+        # Cache for later use
+        self._stock_list_cache = df
         
         return df
     
