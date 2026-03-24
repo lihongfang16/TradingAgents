@@ -77,25 +77,38 @@ def _get_a_share_context(symbol: str) -> str:
     return "\n".join(context_parts)
 
 
-def create_market_analyst(llm):
+_CHINESE_SYSTEM_MESSAGE = (
+    """你是一位交易助手，负责分析金融市场。你的任务是从以下列表中选择**最相关的指标**来分析给定市场条件或交易策略。目标是选择最多 **8 个指标**，提供互补的洞察而避免冗余。各类别及其指标如下：
 
-    def market_analyst_node(state):
-        current_date = state["trade_date"]
-        instrument_context = build_instrument_context(state["company_of_interest"])
+移动平均线：
+- close_50_sma: 50 日简单移动平均线：中期趋势指标。用途：判断趋势方向，作为动态支撑/阻力位。提示：滞后于价格；结合更快指标以获得及时信号。
+- close_200_sma: 200 日简单移动平均线：长期趋势基准。用途：确认整体市场趋势，识别黄金交叉/死叉结构。提示：反应较慢；最适合战略趋势确认而非频繁交易信号。
+- close_10_ema: 10 日指数移动平均线：快速短期均值。用途：捕捉动量快速变化和潜在入场点。提示：在震荡市场中容易产生噪音；配合更长周期均线使用。
 
-        # Detect A-share and build additional context
-        symbol = state["company_of_interest"]
-        a_share_extra = ""
-        if is_a_share(symbol):
-            a_share_extra = "\n" + _get_a_share_context(symbol)
+MACD 相关：
+- macd: MACD：通过 EMA 差异计算动量。用途：寻找交叉和背离作为趋势变化信号。提示：在低波动或横盘市场中用其他指标确认。
+- macds: MACD 信号线：MACD 线的 EMA 平滑。用途：与 MACD 线交叉触发交易。提示：应作为更广泛策略的一部分以避免假信号。
+- macdh: MACD 柱状图：显示 MACD 线与其信号线之间的差距。用途：可视化动量强度及早发现背离。提示：可能波动较大；在快速市场中配合额外过滤器使用。
 
-        tools = [
-            get_stock_data,
-            get_indicators,
-        ]
+动量指标：
+- rsi: RSI：测量动量，标识超买/超卖状态。用途：应用 70/30 阈值，观察背离以预示反转。提示：在强势趋势中 RSI 可能维持极端值；务必与趋势分析交叉验证。
 
-        base_system_message = (
-            """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
+波动性指标：
+- boll: 布林带中轨：20 日简单移动平均线。用途：作为价格运动的动态基准。提示：结合上轨和下轨有效识别突破或反转。
+- boll_ub: 布林带上轨：通常为中轨上方 2 个标准差。用途：标识潜在超买条件和突破区域。提示：用其他工具确认信号；在强势趋势中价格可能沿着上轨运行。
+- boll_lb: 布林带下轨：通常为中轨下方 2 个标准差。用途：标识潜在超卖状态。提示：使用额外分析避免假反转信号。
+- atr: ATR：平均真实波幅，衡量波动性。用途：设置止损位并根据当前市场波动性调整仓位。提示：这是反应性指标，作为更广泛风险管理策略的一部分使用。
+
+成交量指标：
+- vwma: VWMA：成交量加权移动平均线。用途：通过整合价格与成交量数据确认趋势。提示：注意成交量突增导致的偏差；配合其他成交量分析使用。
+
+- 选择提供多样化、互补信息的指标。避免冗余（例如不要同时选择 rsi 和 stochrsi）。同时简要解释为什么它们适合给定市场环境。请确保先调用 get_stock_data 获取 CSV 数据以生成指标。然后使用 get_indicators 获取具体指标名称。请撰写一份非常详细和细致的报告，描述你观察到的趋势。提供具体的、可操作的见解和支撑证据，帮助交易者做出明智决策。
+"""
+    + " 请在报告末尾附上 Markdown 表格，整理报告中的关键要点，清晰易读。"
+)
+
+_ENGLISH_SYSTEM_MESSAGE = (
+    """You are a trading assistant tasked with analyzing financial markets. Your role is to select the **most relevant indicators** for a given market condition or trading strategy from the following list. The goal is to choose up to **8 indicators** that provide complementary insights without redundancy. Categories and each category's indicators are:
 
 Moving Averages:
 - close_50_sma: 50 SMA: A medium-term trend indicator. Usage: Identify trend direction and serve as dynamic support/resistance. Tips: It lags price; combine with faster indicators for timely signals.
@@ -121,9 +134,30 @@ Volume-Based Indicators:
 
 - Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
-        )
+)
 
-        system_message = base_system_message + a_share_extra
+
+def create_market_analyst(llm):
+
+    def market_analyst_node(state):
+        current_date = state["trade_date"]
+        instrument_context = build_instrument_context(state["company_of_interest"])
+
+        # Detect A-share and build additional context
+        symbol = state["company_of_interest"]
+        a_share_extra = ""
+        if is_a_share(symbol):
+            a_share_extra = "\n" + _get_a_share_context(symbol)
+
+        tools = [
+            get_stock_data,
+            get_indicators,
+        ]
+
+        if is_a_share(symbol):
+            system_message = _CHINESE_SYSTEM_MESSAGE + "\n" + _get_a_share_context(symbol)
+        else:
+            system_message = _ENGLISH_SYSTEM_MESSAGE + a_share_extra
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -135,6 +169,7 @@ Volume-Based Indicators:
                     " will help where you left off. Execute what you can to make progress."
                     " If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable,"
                     " prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop."
+                    " IMPORTANT: When analyzing A-share (Chinese) stocks, always respond in Chinese."
                     " You have access to the following tools: {tool_names}.\n{system_message}"
                     "For your reference, the current date is {current_date}. {instrument_context}",
                 ),
