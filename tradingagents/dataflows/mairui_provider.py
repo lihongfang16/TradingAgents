@@ -363,8 +363,9 @@ if __name__ == "__main__":
     # Check if licence is available
     licence = os.environ.get('MAIRUI_LICENCE')
     if not licence:
-        print("Using provided test licence...")
-        licence = "BDF90534-E1FD-4F16-9CD4-B8F9275AE19F"
+        print("ERROR: MAIRUI_LICENCE environment variable not set")
+        print("Please set it with: export MAIRUI_LICENCE=your_licence_key")
+        exit(1)
     
     try:
         provider = MairuiProvider(licence)
