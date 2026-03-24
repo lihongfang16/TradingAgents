@@ -1,6 +1,6 @@
 """
 ChinaDataManager - Multi-source failover manager for A-share stocks.
-Priority chain: Ashare > AkShare > BaoStock
+Priority chain: Ashare > AkShare > BaoStock > Mairui
 
 Provides unified interface across data providers:
 - get_kline(): K-line data (daily/weekly/monthly)
@@ -19,6 +19,7 @@ import pandas as pd
 from .ashare_provider import AshareProvider
 from .akshare_provider import AkShareProvider
 from .baostock_provider import BaoStockProvider
+from .mairui_provider import MairuiProvider
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,12 @@ logger = logging.getLogger(__name__)
 class ChinaDataManager:
     """
     Multi-source data manager for A-share stocks.
-    
-    Implements priority-based failover across three data providers:
+
+    Implements priority-based failover across four data providers:
     1. AshareProvider  - Sina + Tencent dual-core (fastest, no install needed)
     2. AkShareProvider - AkShare library (richest data, needs pip install)
     3. BaoStockProvider - BaoStock library (reliable history, needs pip install + login)
+    4. MairuiProvider  - Mairui API (licence-based, professional data)
     """
 
     def __init__(self):
@@ -39,6 +41,7 @@ class ChinaDataManager:
             AshareProvider(),      # Priority 1: Sina/Tencent (no deps)
             AkShareProvider(),     # Priority 2: AkShare (rich data)
             BaoStockProvider(),    # Priority 3: BaoStock (reliable history)
+            MairuiProvider(),      # Priority 4: Mairui API (licence-based)
         ]
 
     # ── Symbol helpers ──────────────────────────────────────────────
