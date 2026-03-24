@@ -1,6 +1,6 @@
 """
 ChinaDataManager - Multi-source failover manager for A-share stocks.
-Priority chain: Ashare > AkShare > BaoStock > Mairui
+Priority chain: Mairui > Ashare > AkShare > BaoStock
 
 Provides unified interface across data providers:
 - get_kline(): K-line data (daily/weekly/monthly)
@@ -8,9 +8,11 @@ Provides unified interface across data providers:
 - get_fundamental_data(): Fundamental/financial data
 
 Auto-failover: if primary source fails, tries next in chain.
+Environment variable A_SHARE_DATA_SOURCE can override the default priority order.
 """
 
 import logging
+import os
 import re
 from typing import Optional, Dict, Any, List
 
@@ -24,25 +26,93 @@ from .mairui_provider import MairuiProvider
 logger = logging.getLogger(__name__)
 
 
+# Default priority order: Mairui (主) → Ashare (实时备选) → AkShare (数据补充) → BaoStock (历史备选)
+DEFAULT_PRIORITY = [
+    'mairui',
+    'ashare',
+    'akshare',
+    'baostock',
+]
+
+
 class ChinaDataManager:
     """
     Multi-source data manager for A-share stocks.
 
     Implements priority-based failover across four data providers:
-    1. AshareProvider  - Sina + Tencent dual-core (fastest, no install needed)
-    2. AkShareProvider - AkShare library (richest data, needs pip install)
-    3. BaoStockProvider - BaoStock library (reliable history, needs pip install + login)
-    4. MairuiProvider  - Mairui API (licence-based, professional data)
+    1. MairuiProvider  - Mairui API (licence-based, professional data, most stable)
+    2. AshareProvider  - Sina + Tencent dual-core (fast, realtime fallback)
+    3. AkShareProvider - AkShare library (rich data, data supplement)
+    4. BaoStockProvider - BaoStock library (reliable history, backup)
     """
 
-    def __init__(self):
-        """Initialize providers in priority order."""
-        self.providers: List[Any] = [
-            AshareProvider(),      # Priority 1: Sina/Tencent (no deps)
-            AkShareProvider(),     # Priority 2: AkShare (rich data)
-            BaoStockProvider(),    # Priority 3: BaoStock (reliable history)
-            MairuiProvider(),      # Priority 4: Mairui API (licence-based)
-        ]
+    def __init__(self, priority: Optional[List[str]] = None):
+        """
+        Initialize providers in priority order.
+        
+        Args:
+            priority: Custom priority list. If None, reads from A_SHARE_DATA_SOURCE env var,
+                      or uses DEFAULT_PRIORITY if not set.
+                      Values: 'mairui', 'ashare', 'akshare', 'baostock'
+        """
+        if priority is None:
+            priority = self._load_priority_from_env()
+        
+        self.providers: List[Any] = self._build_provider_chain(priority)
+        
+        # Log the priority order
+        provider_names = [p.__class__.__name__ for p in self.providers]
+        logger.info("ChinaDataManager initialized with priority: %s", provider_names)
+    
+    def _load_priority_from_env(self) -> List[str]:
+        """Load priority order from A_SHARE_DATA_SOURCE env var."""
+        env_priority = os.environ.get('A_SHARE_DATA_SOURCE', '').lower()
+        
+        if not env_priority:
+            return DEFAULT_PRIORITY.copy()
+        
+        # Parse comma-separated list: "mairui,ashare,akshare,baostock"
+        if ',' in env_priority:
+            priority = [p.strip() for p in env_priority.split(',') if p.strip()]
+            if self._validate_priority(priority):
+                return priority
+            else:
+                logger.warning("Invalid A_SHARE_DATA_SOURCE format, using default: %s", env_priority)
+                return DEFAULT_PRIORITY.copy()
+        
+        # Single value means use that as primary, rest as fallback
+        if env_priority in ['mairui', 'ashare', 'akshare', 'baostock']:
+            primary = env_priority
+            fallback = [p for p in DEFAULT_PRIORITY if p != primary]
+            return [primary] + fallback
+        
+        logger.warning("Unknown A_SHARE_DATA_SOURCE value: %s, using default", env_priority)
+        return DEFAULT_PRIORITY.copy()
+    
+    def _validate_priority(self, priority: List[str]) -> bool:
+        """Validate that priority list contains all providers."""
+        valid = {'mairui', 'ashare', 'akshare', 'baostock'}
+        return set(priority) == valid and len(priority) == len(valid)
+    
+    def _build_provider_chain(self, priority: List[str]) -> List[Any]:
+        """Build provider chain from priority list."""
+        provider_map = {
+            'mairui': MairuiProvider,
+            'ashare': AshareProvider,
+            'akshare': AkShareProvider,
+            'baostock': BaoStockProvider,
+        }
+        
+        chain = []
+        for name in priority:
+            provider_class = provider_map.get(name)
+            if provider_class:
+                try:
+                    chain.append(provider_class())
+                except Exception as e:
+                    logger.warning("Failed to initialize %s: %s", provider_class.__name__, e)
+        
+        return chain
 
     # ── Symbol helpers ──────────────────────────────────────────────
 
