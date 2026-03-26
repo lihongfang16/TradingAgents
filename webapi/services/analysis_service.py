@@ -2,9 +2,12 @@
 """
 Async wrapper service for the core AnalysisRunner, providing task management
 and progress tracking for the FastAPI layer.
+
+Storage is backed by PostgreSQL via SQLAlchemy ORM (AnalysisTask model).
 """
 
 import asyncio
+import logging
 import os
 import traceback
 import uuid
@@ -14,16 +17,20 @@ from typing import Any, Callable, Dict, List, Optional
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
-# Find project root (where .env file is located)
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-# Go up 3 levels: services -> webapi -> project_root
-_project_root = os.path.abspath(os.path.join(_current_dir, '..', '..'))
-env_path = os.path.join(_project_root, '.env')
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-else:
-    # Fallback: try loading from current working directory
-    load_dotenv()
+# Try multiple locations for .env file
+env_loaded = False
+for env_path in ['.env', '../.env', '../../.env', 'D:/1.MyProjects/Other/tradingagents-a-share/.env']:
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        env_loaded = True
+        print(f"[ENV] Loaded .env from: {env_path}", flush=True)
+        break
+if not env_loaded:
+    load_dotenv()  # Fallback to default behavior
+    print("[ENV] Using default load_dotenv()", flush=True)
+
+# Debug: check if key is loaded
+print(f"[ENV] OPENAI_API_KEY present: {bool(os.getenv('OPENAI_API_KEY'))}", flush=True)
 
 from tradingagents.core.analysis_runner import AnalysisRunner
 from webapi.models.analysis import (
@@ -33,98 +40,171 @@ from webapi.models.analysis import (
     BatchAnalysisRequest,
     BatchAnalysisResponse,
 )
+from webapi.models.database import AnalysisTask
+from webapi.config.database import SessionLocal
+
+# Import local history persistence (no API dependencies)
+from webapi.services.history_persistence import add_to_local_history
+
+logger = logging.getLogger(__name__)
+
+
+def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
+    """Convert an AnalysisTask ORM row to an AnalysisResponse Pydantic model."""
+    # Extract decision from result.signal if available
+    result_data = task.result if task.result else None
+
+    return AnalysisResponse(
+        task_id=task.task_id,
+        status=AnalysisStatus(task.status),
+        symbol=task.symbol,
+        message=task.message or "",
+        created_at=task.created_at.isoformat() if task.created_at else None,
+        updated_at=task.updated_at.isoformat() if task.updated_at else None,
+        completed_at=task.completed_at.isoformat() if task.completed_at else None,
+        result=result_data,
+        error=task.error,
+        logs=[],  # logs are not persisted in DB
+    )
 
 
 class AnalysisService:
     """
     Async wrapper service for running TradingAgents analysis tasks.
-    
+
     Provides task management, progress tracking, and async execution
-    for the FastAPI web layer.
+    for the FastAPI web layer. Task state is persisted to PostgreSQL.
     """
 
     def __init__(self, max_workers: int = 4):
         """
         Initialize the AnalysisService.
-        
+
         Args:
             max_workers: Maximum number of concurrent analysis tasks (default: 4)
         """
-        self._tasks: Dict[str, AnalysisResponse] = {}
         self._batch_tasks: Dict[str, BatchAnalysisResponse] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._progress_callbacks: Dict[str, Callable] = {}
 
+    # ------------------------------------------------------------------
+    # CRUD operations backed by PostgreSQL
+    # ------------------------------------------------------------------
+
     def create_task(self, request: AnalysisRequest) -> AnalysisResponse:
         """
-        Create a new analysis task and store it in memory.
-        
+        Create a new analysis task and persist it to the database.
+
         Args:
             request: AnalysisRequest containing analysis parameters
-            
+
         Returns:
             AnalysisResponse with task_id and initial status
         """
-        task_id = str(uuid.uuid4())
-        
-        task_response = AnalysisResponse(
-            task_id=task_id,
-            status=AnalysisStatus.PENDING,
-            symbol=request.symbol,
-            message=f"Task created for {request.symbol}",
-            created_at=datetime.now().isoformat(),
-            logs=[f"Task {task_id} created at {datetime.now().isoformat()}"],
-        )
-        
-        self._tasks[task_id] = task_response
-        return task_response
+        db = SessionLocal()
+        try:
+            now = datetime.utcnow()
+            task = AnalysisTask(
+                task_id=str(uuid.uuid4()),
+                symbol=request.symbol,
+                status=AnalysisStatus.PENDING.value,
+                created_at=now,
+                message=f"Task created for {request.symbol}",
+            )
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            return _orm_to_response(task)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def get_task(self, task_id: str) -> Optional[AnalysisResponse]:
         """
-        Retrieve a task by its ID.
-        
+        Retrieve a task by its ID from the database.
+
         Args:
             task_id: UUID of the task to retrieve
-            
+
         Returns:
             AnalysisResponse if found, None otherwise
         """
-        return self._tasks.get(task_id)
+        db = SessionLocal()
+        try:
+            task = db.query(AnalysisTask).filter(
+                AnalysisTask.task_id == task_id
+            ).first()
+            return _orm_to_response(task) if task else None
+        finally:
+            db.close()
 
     def list_tasks(
-        self, 
+        self,
         status: Optional[AnalysisStatus] = None,
         symbol: Optional[str] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
     ) -> List[AnalysisResponse]:
         """
         List all tasks, optionally filtered by status and symbol.
-        
+
         Args:
             status: Optional status filter
             symbol: Optional symbol filter
             limit: Maximum number of results to return
-            
+
         Returns:
             List of AnalysisResponse objects
         """
-        tasks = list(self._tasks.values())
-        
-        if status is not None:
-            tasks = [task for task in tasks if task.status == status]
-        
-        if symbol is not None:
-            tasks = [task for task in tasks if task.symbol == symbol]
-        
-        if limit is not None:
-            tasks = tasks[:limit]
-        
-        return tasks
+        db = SessionLocal()
+        try:
+            query = db.query(AnalysisTask)
+            if status is not None:
+                query = query.filter(AnalysisTask.status == status.value)
+            if symbol is not None:
+                query = query.filter(AnalysisTask.symbol == symbol)
+            query = query.order_by(AnalysisTask.created_at.desc())
+            if limit is not None:
+                query = query.limit(limit)
+            return [_orm_to_response(t) for t in query.all()]
+        finally:
+            db.close()
+
+    def delete_task(self, task_id: str) -> bool:
+        """
+        Delete a task from the database by its ID.
+
+        Args:
+            task_id: UUID of the task to delete
+
+        Returns:
+            True if the task was found and deleted, False otherwise
+        """
+        db = SessionLocal()
+        try:
+            task = db.query(AnalysisTask).filter(
+                AnalysisTask.task_id == task_id
+            ).first()
+            if task is None:
+                return False
+            db.delete(task)
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
+    # Progress helpers
+    # ------------------------------------------------------------------
 
     def register_progress_callback(self, task_id: str, callback: Callable) -> None:
         """
         Register a progress callback for a task.
-        
+
         Args:
             task_id: UUID of the task
             callback: Callable that accepts (task_id, progress_pct, current_agent)
@@ -134,42 +214,38 @@ class AnalysisService:
     def get_task_progress(self, task_id: str) -> Dict[str, Any]:
         """
         Get progress information for a task including elapsed and remaining time.
-        
+
         Args:
             task_id: UUID of the task
-            
+
         Returns:
             Dict with progress info
         """
-        import time
-        task = self._tasks.get(task_id)
-        if not task:
+        task_resp = self.get_task(task_id)
+        if not task_resp:
             return {}
-        
+
         # Calculate elapsed time
-        created_at = task.created_at
+        created_at = task_resp.created_at
         if created_at:
             try:
-                from datetime import datetime
                 start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                # Handle both timezone-aware and naive datetime
                 now = datetime.now()
                 if start_dt.tzinfo is not None:
                     now = datetime.now(start_dt.tzinfo)
                 elapsed = (now - start_dt.replace(tzinfo=None)).total_seconds()
-            except:
+            except Exception:
                 elapsed = 0
         else:
             elapsed = 0
-        
+
         # Estimate total time based on analysts count (rough estimate)
-        analysts = getattr(task, 'analysts', None) or []
+        analysts = task_resp.result.get("analysts", []) if task_resp.result else []
         analyst_count = len(analysts) if analysts else 1
-        # Base estimate: 60 seconds per analyst + 60 seconds base
         estimated_total = 60 * analyst_count + 60
-        
+
         # Calculate progress based on status
-        status = task.status
+        status = task_resp.status
         if status == AnalysisStatus.COMPLETED:
             progress = 100
             remaining = 0
@@ -180,7 +256,6 @@ class AnalysisService:
             progress = 0
             remaining = estimated_total
         else:  # RUNNING
-            # Estimate progress based on elapsed time vs expected
             if elapsed < 30:
                 progress = min(10, (elapsed / 30) * 10)
             elif elapsed < 60:
@@ -188,82 +263,162 @@ class AnalysisService:
             elif elapsed < 120:
                 progress = 30 + min(25, ((elapsed - 60) / 60) * 25)
             else:
-                progress = min(55, 55 + ((elapsed - 120) / 120) * 20)  # Up to 75% at 4 min
+                progress = min(55, 55 + ((elapsed - 120) / 120) * 20)
             remaining = max(0, estimated_total - elapsed)
-        
+
         return {
             "task_id": task_id,
             "status": status.value if hasattr(status, 'value') else str(status),
             "progress": round(progress, 1),
             "elapsed": round(elapsed, 1),
             "remaining": round(remaining, 1),
-            "message": task.message or "",
+            "message": task_resp.message or "",
         }
+
+    # ------------------------------------------------------------------
+    # Analysis execution
+    # ------------------------------------------------------------------
 
     async def run_analysis(
         self, task_id: str, request: AnalysisRequest
     ) -> AnalysisResponse:
         """
         Run analysis for a task asynchronously using thread pool executor.
-        
+
         Args:
             task_id: UUID of the task to run
             request: AnalysisRequest containing analysis parameters
-            
+
         Returns:
             AnalysisResponse with completed analysis result
         """
-        # Get or create task
-        task = self._tasks.get(task_id)
-        if task is None:
-            task = self.create_task(request)
-            task_id = task.task_id
+        # Get or create task from DB
+        task_resp = self.get_task(task_id)
+        if task_resp is None:
+            task_resp = self.create_task(request)
+            task_id = task_resp.task_id
 
-        # Update status to running
-        task.status = AnalysisStatus.RUNNING
-        task.updated_at = datetime.now().isoformat()
-        task.message = f"Running analysis for {request.symbol}"
-        task.logs.append(f"Started analysis at {datetime.now().isoformat()}")
-        self._tasks[task_id] = task
-
+        # Update status to RUNNING in DB
+        now = datetime.utcnow()
+        db = SessionLocal()
         try:
-            # Get event loop and run sync analysis in executor
-            loop = asyncio.get_event_loop()
-            
+            db_task = db.query(AnalysisTask).filter(
+                AnalysisTask.task_id == task_id
+            ).first()
+            if db_task:
+                db_task.status = AnalysisStatus.RUNNING.value
+                db_task.updated_at = now
+                db_task.message = f"Running analysis for {request.symbol}"
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        # Re-read to get fresh state
+        task_resp = self.get_task(task_id)
+
+        result = None
+        try:
             # Run the sync analysis in thread pool
+            loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, self._run_sync_analysis, task_id, request
             )
-            
-            # Update task with result
-            task.result = result
-            task.status = AnalysisStatus.COMPLETED
-            task.completed_at = datetime.now().isoformat()
-            task.message = f"Analysis completed for {request.symbol}"
-            task.logs.append(f"Completed at {datetime.now().isoformat()}")
-            
+
+            # Update task with result in DB
+            now = datetime.utcnow()
+            db = SessionLocal()
+            try:
+                db_task = db.query(AnalysisTask).filter(
+                    AnalysisTask.task_id == task_id
+                ).first()
+                if db_task:
+                    db_task.result = result
+                    db_task.completed_at = now
+                    db_task.updated_at = now
+
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        db_task.status = AnalysisStatus.FAILED.value
+                        db_task.error = result.get("error", "Analysis failed")
+                        db_task.message = f"Analysis failed: {db_task.error}"
+                    else:
+                        db_task.status = AnalysisStatus.COMPLETED.value
+                        db_task.message = f"Analysis completed for {request.symbol}"
+                        # Extract decision from result.signal
+                        if result and isinstance(result.get("signal"), dict):
+                            db_task.decision = result["signal"].get("decision")
+
+                    db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
         except Exception as e:
-            task.status = AnalysisStatus.FAILED
-            task.error = str(e)
-            task.completed_at = datetime.now().isoformat()
-            task.message = f"Analysis failed: {str(e)}"
-            task.logs.append(f"Failed at {datetime.now().isoformat()}: {traceback.format_exc()}")
-        
-        task.updated_at = datetime.now().isoformat()
-        self._tasks[task_id] = task
-        
-        return task
+            now = datetime.utcnow()
+            db = SessionLocal()
+            try:
+                db_task = db.query(AnalysisTask).filter(
+                    AnalysisTask.task_id == task_id
+                ).first()
+                if db_task:
+                    db_task.status = AnalysisStatus.FAILED.value
+                    db_task.error = str(e)
+                    db_task.completed_at = now
+                    db_task.updated_at = now
+                    db_task.message = f"Analysis failed: {str(e)}"
+                    db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+
+        # Re-read final state from DB
+        task_resp = self.get_task(task_id)
+        if task_resp is None:
+            # Should not happen — task was just updated — but guard for type safety
+            return AnalysisResponse(
+                task_id=task_id,
+                status=AnalysisStatus.FAILED,
+                symbol=request.symbol,
+                message="Task completed but could not be re-read from database",
+            )
+
+        # Persist to history when task completes (COMPLETED or FAILED)
+        if task_resp and task_resp.status in (AnalysisStatus.COMPLETED, AnalysisStatus.FAILED):
+            try:
+                history_result = dict(task_resp.result or {})
+                history_result["status"] = task_resp.status.value
+                history_result["symbol"] = task_resp.symbol
+                if task_resp.result and isinstance(task_resp.result.get("signal"), dict):
+                    history_result["decision"] = task_resp.result["signal"].get("decision", "UNKNOWN")
+                if task_resp.error:
+                    history_result["error"] = task_resp.error
+                add_to_local_history(
+                    task_id,
+                    task_resp.symbol,
+                    history_result,
+                    created_at=task_resp.created_at or "",
+                    updated_at=task_resp.completed_at or "",
+                )
+            except Exception as hist_err:
+                logger.warning("History persistence warning: %s", hist_err)
+
+        return task_resp
 
     def _run_sync_analysis(
         self, task_id: str, request: AnalysisRequest
     ) -> Dict[str, Any]:
         """
         Synchronous analysis runner to be executed in thread pool.
-        
+
         Args:
             task_id: UUID of the task
             request: AnalysisRequest containing analysis parameters
-            
+
         Returns:
             Dict containing analysis results
         """
@@ -271,28 +426,36 @@ class AnalysisService:
             # Build parameters for AnalysisRunner
             symbol = request.symbol
             date = request.date or datetime.now().strftime("%Y-%m-%d")
-            
+
             # Determine LLM model and provider
             llm_provider = request.llm_provider or "openai"
-            llm_model = request.deep_model or request.quick_model or "gpt-4"
-            
+
             # Map minimax to openai with custom base_url
             base_url = None
+            api_key = None
             if llm_provider.lower() == "minimax":
                 base_url = os.environ.get("MINIMAX_API_BASE", "https://api.minimax.chat/v1")
                 llm_provider = "openai"
-                # MiniMax API key needs to be in OPENAI_API_KEY for OpenAIClient
-                # Try MINIMAX_API_KEY first, fallback to OPENAI_API_KEY
-                minimax_key = os.getenv("MINIMAX_API_KEY")
-                openai_key = os.getenv("OPENAI_API_KEY")
-                if minimax_key:
-                    os.environ["OPENAI_API_KEY"] = minimax_key
-                elif openai_key:
-                    # Already set in OPENAI_API_KEY, ensure it's in environ
-                    os.environ["OPENAI_API_KEY"] = openai_key
-            
+                # Get API key without mutating global state
+                api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
+                print(f"[API_KEY_TRACE] analysis_service: api_key length = {len(api_key) if api_key else 0}", flush=True)
+
+            # Determine model (use MiniMax default for minimax, gpt-4 for openai)
+            if base_url and "minimax" in base_url.lower():
+                llm_model = request.deep_model or request.quick_model or "MiniMax-M2.7"
+            else:
+                llm_model = request.deep_model or request.quick_model or "gpt-4"
+
+            # Always get API key for custom base_url (MiniMax compatibility)
+            if not api_key and base_url:
+                api_key = os.getenv("OPENAI_API_KEY")
+                print(f"[API_KEY_TRACE] analysis_service (base_url): api_key length = {len(api_key) if api_key else 0}", flush=True)
+
+            # Debug: print llm_provider
+            print(f"[DEBUG] llm_provider={llm_provider}, llm_model={llm_model}, base_url={base_url}, api_key_present={bool(api_key)}", flush=True)
+
             analysts = request.analysts or ["market", "news", "fundamentals"]
-            
+
             # Create runner instance
             runner = AnalysisRunner(
                 symbol=symbol,
@@ -300,23 +463,25 @@ class AnalysisService:
                 analysts=analysts,
                 llm_model=llm_model,
                 llm_provider=llm_provider,
+                max_iterations=300,
                 base_url=base_url,
+                api_key=api_key,
             )
-            
+
             # Run analysis
             result = runner.run()
-            
+
             # Invoke progress callback if registered
             if task_id in self._progress_callbacks:
                 callback = self._progress_callbacks[task_id]
                 callback(
                     task_id,
                     result.get("progress_pct", 0),
-                    result.get("current_agent", "")
+                    result.get("current_agent", ""),
                 )
-            
+
             return result
-            
+
         except Exception as e:
             return {
                 "status": "error",
@@ -326,21 +491,25 @@ class AnalysisService:
                 "current_agent": "error",
             }
 
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
     async def run_batch(
         self, request: BatchAnalysisRequest
     ) -> BatchAnalysisResponse:
         """
         Run batch analysis for multiple symbols.
-        
+
         Args:
             request: BatchAnalysisRequest containing symbols and parameters
-            
+
         Returns:
             BatchAnalysisResponse with all task results
         """
         batch_id = str(uuid.uuid4())
-        
-        # Create individual tasks for each symbol
+
+        # Create individual tasks for each symbol (persists to DB)
         tasks = []
         for symbol in request.symbols:
             single_request = AnalysisRequest(
@@ -352,7 +521,7 @@ class AnalysisService:
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
-        
+
         # Create batch response
         batch_response = BatchAnalysisResponse(
             batch_id=batch_id,
@@ -362,12 +531,11 @@ class AnalysisService:
             created_at=datetime.now().isoformat(),
         )
         self._batch_tasks[batch_id] = batch_response
-        
+
         # Run all tasks concurrently
-        async def run_single(task_id: str, req: AnalysisRequest):
-            return await self.run_analysis(task_id, req)
-        
-        # Execute all tasks
+        async def run_single(tid: str, req: AnalysisRequest):
+            return await self.run_analysis(tid, req)
+
         coroutines = [
             run_single(task.task_id, AnalysisRequest(
                 symbol=task.symbol,
@@ -378,24 +546,24 @@ class AnalysisService:
             ))
             for task in tasks
         ]
-        
+
         results = await asyncio.gather(*coroutines, return_exceptions=True)
-        
+
         # Update batch status
         batch_response.tasks = results
         failed_count = sum(1 for r in results if isinstance(r, Exception) or r.status == AnalysisStatus.FAILED)
         batch_response.status = AnalysisStatus.FAILED if failed_count == len(results) else AnalysisStatus.COMPLETED
-        
+
         self._batch_tasks[batch_id] = batch_response
         return batch_response
 
     def get_batch(self, batch_id: str) -> Optional[BatchAnalysisResponse]:
         """
         Retrieve a batch by its ID.
-        
+
         Args:
             batch_id: UUID of the batch to retrieve
-            
+
         Returns:
             BatchAnalysisResponse if found, None otherwise
         """
@@ -404,40 +572,48 @@ class AnalysisService:
     def cancel_task(self, task_id: str) -> bool:
         """
         Cancel a running task (marks as cancelled, does not kill running thread).
-        
+
         Args:
             task_id: UUID of the task to cancel
-            
+
         Returns:
             True if task was found and marked as cancelled, False otherwise
         """
-        task = self._tasks.get(task_id)
-        if task is None:
+        db = SessionLocal()
+        try:
+            db_task = db.query(AnalysisTask).filter(
+                AnalysisTask.task_id == task_id
+            ).first()
+            if db_task is None:
+                return False
+
+            current_status = db_task.status
+            if current_status in (
+                AnalysisStatus.RUNNING.value,
+                AnalysisStatus.PENDING.value,
+            ):
+                db_task.status = AnalysisStatus.CANCELLED.value
+                db_task.message = (
+                    "Task cancellation requested"
+                    if current_status == AnalysisStatus.RUNNING.value
+                    else "Task cancelled before execution"
+                )
+                db_task.updated_at = datetime.utcnow()
+                db.commit()
+                return True
+
             return False
-        
-        if task.status == AnalysisStatus.RUNNING:
-            # Cannot truly cancel a running task, just mark it
-            task.status = AnalysisStatus.CANCELLED
-            task.message = "Task cancellation requested"
-            task.updated_at = datetime.now()
-            self._tasks[task_id] = task
-            return True
-        elif task.status in (AnalysisStatus.PENDING,):
-            task.status = AnalysisStatus.CANCELLED
-            task.message = "Task cancelled before execution"
-            task.updated_at = datetime.now()
-            self._tasks[task_id] = task
-            return True
-        
-        return False
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def create_batch_task(self, request: BatchAnalysisRequest) -> BatchAnalysisResponse:
         """Create a batch task (synchronous wrapper for run_batch)."""
-        import asyncio
-        # Create batch ID and initial tasks synchronously
         batch_id = str(uuid.uuid4())
-        
-        # Create individual tasks for each symbol
+
+        # Create individual tasks for each symbol (persists to DB)
         tasks = []
         for symbol in request.symbols:
             single_request = AnalysisRequest(
@@ -449,7 +625,7 @@ class AnalysisService:
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
-        
+
         # Create batch response
         batch_response = BatchAnalysisResponse(
             batch_id=batch_id,
