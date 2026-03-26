@@ -6,13 +6,19 @@ from sqlalchemy import pool
 from alembic import context
 import sys
 from pathlib import Path
+import os
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import models
 from webapi.models.database import Base, AnalysisTask
-from webapi.config.database import engine
+
+# Get DATABASE_URL from environment (fallback to default for local dev)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://trading:trading123@localhost:5432/trading_db"
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -45,9 +51,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -64,11 +69,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    from sqlalchemy import create_engine
+    connectable = create_engine(DATABASE_URL, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(

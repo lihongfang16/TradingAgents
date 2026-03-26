@@ -46,25 +46,16 @@ def save_deleted_ids(deleted_ids: set):
 
 
 def load_history() -> List[Dict[str, Any]]:
-    """Load analysis history from local file and API.
+    """Load analysis history from API (primary) with local cache fallback.
+    
+    PostgreSQL is the source of truth. Local JSON is only used as:
+    - Cache when API is unavailable
+    - Export/backup (not active merge source)
     
     Returns:
-        List of history records (merged from local and API)
+        List of history records from API (or local cache if API down)
     """
     ensure_history_dir()
-    
-    # First, load local records
-    local_records = []
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, dict) and 'records' in data:
-                    local_records = data['records']
-                elif isinstance(data, list):
-                    local_records = data
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
     
     # Helper to extract decision from final_state messages
     def extract_decision_from_result(result_data):
@@ -99,11 +90,13 @@ def load_history() -> List[Dict[str, Any]]:
         
         return decision, confidence
     
-    # Then, try to fetch from API and merge
+    # PRIMARY: Try to fetch from API (PostgreSQL is source of truth)
     api_records = []
+    api_available = False
     try:
         resp = requests.get(f"{API_URL}/api/v1/analysis/", params={"limit": 50}, timeout=5)
         if resp.status_code == 200:
+            api_available = True
             api_tasks = resp.json()
             for task in api_tasks:
                 result_data = task.get("result", {}) or {}
@@ -126,44 +119,27 @@ def load_history() -> List[Dict[str, Any]]:
                 }
                 api_records.append(record)
     except Exception:
-        # API unavailable, just use local records
-        traceback.print_exc(file=sys.stderr)
+        # API unavailable, will fall back to local cache
+        pass
     
-    # Load deleted IDs (tombstone) to filter out deleted records from API
-    deleted_ids = load_deleted_ids()
+    # If API is available, use it as source of truth (ignore local merge)
+    if api_available:
+        return api_records
     
-    # Merge: keep local-only metadata, but API status/result is authoritative
-    merged = {}
+    # FALLBACK: API unavailable, use local cache only
+    local_records = []
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict) and 'records' in data:
+                    local_records = data['records']
+                elif isinstance(data, list):
+                    local_records = data
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+    
 
-    # First load local records (preserves local-only fields like indicators)
-    for r in local_records:
-        merged[r["task_id"]] = r
-
-    # Then overlay API records, except deleted ones
-    # API status, updated_at, and raw_result win over stale local data
-    # But preserve local-only metadata (like indicators) that API doesn't have
-    for r in api_records:
-        if r["task_id"] not in deleted_ids:
-            local = merged.get(r["task_id"], {})
-            # Start with local data
-            merged_record = dict(local)
-            # Only overwrite with API fields that have non-empty values
-            # or are critical status fields
-            for key, value in r.items():
-                if key in ("status", "updated_at", "raw_result", "result", "error", "message"):
-                    # Always use API values for status-related fields
-                    merged_record[key] = value
-                elif value is not None and value != {} and value != [] and value != "":
-                    # For other fields, only overwrite if API has actual data
-                    merged_record[key] = value
-                # If API value is empty, keep local value (don't overwrite)
-            merged[r["task_id"]] = merged_record
-    
-    # Sort by created_at descending
-    result = sorted(merged.values(), key=lambda x: x.get("created_at", ""), reverse=True)
-    
-    # Keep only last 100
-    return result[:100]
 
 
 def save_history(records: List[Dict[str, Any]]):
