@@ -139,7 +139,7 @@ def load_history() -> List[Dict[str, Any]]:
         except Exception:
             traceback.print_exc(file=sys.stderr)
     
-
+    return local_records
 
 
 def save_history(records: List[Dict[str, Any]]):

@@ -14,11 +14,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import models
 from webapi.models.database import Base, AnalysisTask
 
-# Get DATABASE_URL from environment (fallback to default for local dev)
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://trading:trading123@localhost:5432/trading_db"
-)
+# Get DATABASE_URL from environment (fail fast if not set)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable must be set")
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
