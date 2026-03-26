@@ -16,7 +16,7 @@ HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 DELETED_IDS_FILE = os.path.join(HISTORY_DIR, "deleted_ids.json")
 
 # API URL - use same default as app.py
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+API_URL = os.environ.get("API_URL", "http://localhost:8005")
 
 
 def ensure_history_dir():
@@ -132,16 +132,32 @@ def load_history() -> List[Dict[str, Any]]:
     # Load deleted IDs (tombstone) to filter out deleted records from API
     deleted_ids = load_deleted_ids()
     
-    # Merge: LOCAL records take precedence over API records
-    # This way, deleted local records don't get resurrected by API data
+    # Merge: keep local-only metadata, but API status/result is authoritative
     merged = {}
-    # First add all API records (excluding deleted ones)
-    for r in api_records:
-        if r["task_id"] not in deleted_ids:
-            merged[r["task_id"]] = r
-    # Then overlay local records (local overwrites API)
+
+    # First load local records (preserves local-only fields like indicators)
     for r in local_records:
         merged[r["task_id"]] = r
+
+    # Then overlay API records, except deleted ones
+    # API status, updated_at, and raw_result win over stale local data
+    # But preserve local-only metadata (like indicators) that API doesn't have
+    for r in api_records:
+        if r["task_id"] not in deleted_ids:
+            local = merged.get(r["task_id"], {})
+            # Start with local data
+            merged_record = dict(local)
+            # Only overwrite with API fields that have non-empty values
+            # or are critical status fields
+            for key, value in r.items():
+                if key in ("status", "updated_at", "raw_result", "result", "error", "message"):
+                    # Always use API values for status-related fields
+                    merged_record[key] = value
+                elif value is not None and value != {} and value != [] and value != "":
+                    # For other fields, only overwrite if API has actual data
+                    merged_record[key] = value
+                # If API value is empty, keep local value (don't overwrite)
+            merged[r["task_id"]] = merged_record
     
     # Sort by created_at descending
     result = sorted(merged.values(), key=lambda x: x.get("created_at", ""), reverse=True)
@@ -203,21 +219,79 @@ def add_to_history(task_id: str, symbol: str, result: Dict[str, Any]):
     save_history(records)
 
 
-def delete_from_history(task_id: str):
-    """Delete an analysis from history.
+def load_local_history() -> List[Dict[str, Any]]:
+    """Load history from local file only (no API call).
     
+    Returns:
+        List of local history records
+    """
+    ensure_history_dir()
+    
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict) and 'records' in data:
+                return data['records']
+            elif isinstance(data, list):
+                return data
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+    
+    return []
+
+
+def delete_from_history(task_id: str) -> bool:
+    """Delete an analysis from history via API.
+
+    Calls DELETE /api/v1/analysis/{task_id} first, then removes the
+    local cache entry.  Falls back to local-only delete when the API is
+    unreachable so the UI still works offline.
+
     Args:
         task_id: Task ID to delete
+
+    Returns:
+        True if deletion succeeded, False otherwise
     """
-    # Remove from local records
-    records = load_history()
+    # Try API delete first
+    api_ok = False
+    try:
+        resp = requests.delete(
+            f"{API_URL}/api/v1/analysis/{task_id}",
+            timeout=5,
+        )
+        if resp.status_code == 204:
+            api_ok = True
+        elif resp.status_code == 404:
+            st.error("任务不存在")
+            return False
+        else:
+            st.error(f"删除失败: {resp.status_code}")
+            return False
+    except Exception:
+        # API unreachable — fall back to local-only delete
+        traceback.print_exc(file=sys.stderr)
+
+    # Always clean up local cache (whether API succeeded or was unreachable)
+    records = load_local_history()
     records = [r for r in records if r.get("task_id") != task_id]
     save_history(records)
-    
-    # Add to tombstone so API records don't resurrect it
-    deleted_ids = load_deleted_ids()
-    deleted_ids.add(task_id)
-    save_deleted_ids(deleted_ids)
+
+    if api_ok:
+        # Also remove from tombstone since the server handled it
+        deleted_ids = load_deleted_ids()
+        deleted_ids.discard(task_id)
+        save_deleted_ids(deleted_ids)
+    else:
+        # API was unreachable — keep tombstone so API records don't resurrect it
+        deleted_ids = load_deleted_ids()
+        deleted_ids.add(task_id)
+        save_deleted_ids(deleted_ids)
+
+    return True
 
 
 def get_history_item(task_id: str) -> Optional[Dict[str, Any]]:
@@ -474,10 +548,19 @@ def render_history_manager() -> Optional[str]:
                 "FAILED": "❌"
             }.get(status, "⚪")
 
+            # Translate decision to Chinese
+            decision_text_map = {
+                "BUY": "买入",
+                "SELL": "卖出",
+                "HOLD": "持有",
+                "UNKNOWN": "未知"
+            }
+            decision_cn = decision_text_map.get(decision, decision) if decision else ""
+
             status_text = {
                 "PENDING": "等待中",
                 "RUNNING": "分析中",
-                "COMPLETED": decision if decision else "完成",
+                "COMPLETED": decision_cn if decision_cn else "完成",
                 "FAILED": "失败"
             }.get(status, status)
 
@@ -579,7 +662,7 @@ def render_history_manager() -> Optional[str]:
                     delete_from_history(task_id)
                     st.rerun()
 
-                st.divider()
+            st.divider()
 
         # Summary stats
         st.divider()
@@ -622,9 +705,13 @@ def render_history_detail(task_id: str):
             created_at = api_data.get("created_at", "")
             status = api_data.get("status", "")
             result_data = api_data.get("result", {}) or {}
-            # Check if analysis failed
+            # Check if analysis failed (inner result error OR top-level FAILED status/error)
             if isinstance(result_data, dict) and result_data.get("status") == "error":
                 analysis_error = result_data.get("error", "分析执行失败")
+            elif api_data.get("status") == "FAILED":
+                analysis_error = api_data.get("error", "分析执行失败")
+            elif api_data.get("error"):
+                analysis_error = api_data.get("error", "分析执行失败")
             final_state = result_data.get("final_state", {}) if isinstance(result_data, dict) else {}
             raw_result = result_data
             # Try to get local record for indicators
@@ -637,9 +724,19 @@ def render_history_detail(task_id: str):
             symbol = record.get("symbol", "Unknown")
             created_at = record.get("created_at", "")
             status = record.get("status", "")
-            raw_result = record.get("raw_result", {}) or {}
-            result_data = raw_result.get("final_state", {}) if isinstance(raw_result, dict) else {}
-            final_state = result_data if isinstance(result_data, dict) else {}
+            # Backward compatibility: read raw_result if present, otherwise use record directly
+            raw_result = record.get("raw_result") or record
+            if not isinstance(raw_result, dict):
+                raw_result = {}
+            # Local fallback: use raw_result as result_data (not just final_state)
+            # so we have access to top-level error, status, signal fields
+            result_data = raw_result
+            # Check if analysis failed (local data)
+            # Handle both "error" (old format) and "FAILED" (new format) statuses
+            if isinstance(raw_result, dict):
+                if raw_result.get("status") in ("error", "FAILED") or raw_result.get("error"):
+                    analysis_error = raw_result.get("error") or "分析执行失败"
+            final_state = raw_result.get("final_state", {}) if isinstance(raw_result, dict) else {}
 
         # Ensure final_state is always a dict (never None)
         if not isinstance(final_state, dict):
