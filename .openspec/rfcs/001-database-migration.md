@@ -7,9 +7,20 @@
 ## 状态
 
 - [x] Proposed
-- [ ] Accepted
-- [ ] Implemented
+- [x] Accepted
+- [x] Implemented
 - [ ] Rejected
+
+**实施日期**: 2026-03-26
+
+**实施总结**: 
+PostgreSQL 数据库迁移已成功实施。包括：
+- 数据库 Schema 创建与 Alembic 迁移配置
+- AnalysisService 重写为 PostgreSQL 存储
+- DELETE API 端点实现
+- 前端删除功能集成
+- JSON 历史数据迁移脚本
+- WSL2 和 Linux 环境安装脚本
 
 ## 动机
 

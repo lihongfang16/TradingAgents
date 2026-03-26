@@ -98,6 +98,7 @@ TradingAgents 是一个基于多智能体 LLM 的金融交易框架，模拟真�
 | 2026-03-26 | 添加 PostgreSQL 选型决策 | decisions/001-use-postgresql.md |
 | 2026-03-26 | 添加 WSL2 开发环境决策 | decisions/002-wsl2-for-windows-dev.md |
 | 2026-03-26 | 添加数据库迁移 RFC | rfcs/001-database-migration.md |
+| 2026-03-26 | RFC-001 已接受并实施完成 | rfcs/001-database-migration.md |
 
 ## 贡献指南
 
