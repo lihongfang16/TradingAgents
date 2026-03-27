@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import json
 from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Callable
 
 from langgraph.prebuilt import ToolNode
 
@@ -78,6 +78,13 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
+        # Add api_key if configured
+        api_key = self.config.get("api_key")
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        import logging
+        logging.info(f"[API_KEY_TRACE] trading_graph: api_key length = {len(api_key) if api_key else 0}")
+
         deep_client = create_llm_client(
             provider=self.config["llm_provider"],
             model=self.config["deep_think_llm"],
@@ -121,7 +128,7 @@ class TradingAgentsGraph:
             self.conditional_logic,
         )
 
-        self.propagator = Propagator()
+        self.propagator = Propagator(max_recur_limit=self.config.get("max_recur_limit", 100))
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
 
@@ -191,7 +198,7 @@ class TradingAgentsGraph:
             ),
         }
 
-    def propagate(self, company_name, trade_date):
+    def propagate(self, company_name, trade_date, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
@@ -200,31 +207,43 @@ class TradingAgentsGraph:
         init_agent_state = self.propagator.create_initial_state(
             company_name, trade_date
         )
-        args = self.propagator.get_graph_args()
+        args = self.propagator.get_graph_args(
+            stream_mode=["updates", "values"],
+            version="v2",
+        )
 
-        if self.debug:
-            # Debug mode with tracing
-            trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
-                if len(chunk["messages"]) == 0:
-                    pass
-                else:
-                    chunk["messages"][-1].pretty_print()
-                    trace.append(chunk)
+        final_state = None
+        for chunk in self.graph.stream(init_agent_state, **args):
+            mode = None
+            data = None
 
-            final_state = trace[-1]
-        else:
-            # Standard mode without tracing
-            final_state = self.graph.invoke(init_agent_state, **args)
+            # LangGraph can emit tuple-style chunks for multi stream modes.
+            if isinstance(chunk, tuple) and len(chunk) == 2:
+                mode, data = chunk
+            elif isinstance(chunk, dict):
+                mode = chunk.get("type")
+                data = chunk.get("data")
+                if mode is None and data is None and len(chunk) == 1:
+                    mode, data = next(iter(chunk.items()))
+
+            if mode == "updates":
+                if progress_callback and isinstance(data, dict):
+                    for node_name, state_update in data.items():
+                        progress_callback({"node": node_name, "state": state_update})
+            elif mode == "values":
+                final_state = data
 
         # Store current state for reflection
         self.curr_state = final_state
+
+        if not final_state:
+            return None, None
 
         # Log state
         self._log_state(trade_date, final_state)
 
         # Return decision and processed signal
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        return final_state, self.process_signal(final_state.get("final_trade_decision"))
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

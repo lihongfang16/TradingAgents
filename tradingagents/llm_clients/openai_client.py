@@ -49,13 +49,18 @@ class OpenAIClient(BaseLLMClient):
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
             # When using custom base_url (e.g. MiniMax), read OPENAI_API_KEY
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                llm_kwargs["api_key"] = api_key
+            # ONLY if api_key not already provided via kwargs
+            if "api_key" not in llm_kwargs:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    llm_kwargs["api_key"] = api_key
 
         for key in _PASSTHROUGH_KWARGS:
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
+
+        import logging
+        logging.info(f"[API_KEY_TRACE] openai_client: api_key in kwargs = {'api_key' in llm_kwargs}, length = {len(llm_kwargs.get('api_key', '')) if llm_kwargs.get('api_key') else 0}")
 
         if self.provider == "openai" and not self.base_url:
             llm_kwargs["use_responses_api"] = True

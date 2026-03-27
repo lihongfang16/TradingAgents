@@ -45,6 +45,90 @@ def save_deleted_ids(deleted_ids: set):
         json.dump({'deleted_ids': list(deleted_ids)}, f, indent=2)
 
 
+def load_history_fast() -> List[Dict[str, Any]]:
+    """Fast loading with short timeout to avoid UI blocking."""
+    ensure_history_dir()
+    
+    # Helper to extract decision from final_state messages
+    def extract_decision_from_result(result_data):
+        """Extract decision, confidence from result.final_state.messages if available."""
+        decision = ""
+        confidence = 0
+        
+        final_state = result_data.get("final_state", {}) if isinstance(result_data, dict) else {}
+        if not final_state:
+            return decision, confidence
+        
+        messages = final_state.get("messages", [])
+        if messages:
+            # Get last message content
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict):
+                content = last_msg.get("content", "")
+            elif hasattr(last_msg, 'content'):
+                content = last_msg.content
+            else:
+                content = str(last_msg) if last_msg else ""
+            
+            # Extract decision from "FINAL TRANSACTION PROPOSAL: **BUY/SELL/HOLD**"
+            if "FINAL TRANSACTION PROPOSAL:" in content:
+                proposal_section = content.split("FINAL TRANSACTION PROPOSAL:")[-1].split("---")[0].strip()
+                if "**买入**" in proposal_section or "BUY" in proposal_section.upper():
+                    decision = "BUY"
+                elif "**卖出**" in proposal_section or "SELL" in proposal_section.upper():
+                    decision = "SELL"
+                elif "**持有**" in proposal_section or "HOLD" in proposal_section.upper():
+                    decision = "HOLD"
+        
+        return decision, confidence
+    
+    # Try API with short timeout (1.5s to avoid UI blocking)
+    try:
+        resp = requests.get(f"{API_URL}/api/v1/analysis/", params={"limit": 50}, timeout=1.5)
+        if resp.status_code == 200:
+            api_tasks = resp.json()
+            records = []
+            for task in api_tasks:
+                result_data = task.get("result", {}) or {}
+                decision, confidence = extract_decision_from_result(result_data)
+                
+                # Convert API task to history record format
+                record = {
+                    "task_id": task.get("task_id"),
+                    "symbol": task.get("symbol", ""),
+                    "exchange": task.get("exchange", "CN"),
+                    "created_at": task.get("created_at", ""),
+                    "updated_at": task.get("updated_at", ""),
+                    "status": task.get("status", "PENDING"),
+                    "decision": decision,
+                    "confidence": confidence,
+                    "reasoning": "",
+                    "risk_level": "",
+                    "indicators": {},
+                    "raw_result": result_data
+                }
+                records.append(record)
+            return records
+    except Exception:
+        # API unavailable or slow - fall through to local cache
+        pass
+    
+    # FALLBACK: Use local cache only
+    local_records = []
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict) and 'records' in data:
+                    local_records = data['records']
+                elif isinstance(data, list):
+                    local_records = data
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+    
+    return local_records
+
+
 def load_history() -> List[Dict[str, Any]]:
     """Load analysis history from API (primary) with local cache fallback.
     
@@ -448,7 +532,55 @@ def render_history_manager() -> Optional[str]:
     try:
         st.header("📚 分析历史")
 
-        records = load_history()
+        # Initialize session state for caching
+        if 'history_cache' not in st.session_state:
+            st.session_state.history_cache = []
+            st.session_state.history_cache_time = 0
+        
+        # Check if we need to refresh (cache for 3 seconds to avoid blocking)
+        current_time = datetime.now().timestamp()
+        cache_age = current_time - st.session_state.history_cache_time
+        
+        # Use cached data immediately if available and fresh (< 3 seconds)
+        # This prevents blocking on every Streamlit rerun
+        if st.session_state.history_cache and cache_age < 3:
+            records = st.session_state.history_cache
+        else:
+            # Load with shorter timeout to avoid UI blocking
+            # If API is slow, use cached data
+            try:
+                records = load_history_fast()
+                st.session_state.history_cache = records
+                st.session_state.history_cache_time = current_time
+            except Exception:
+                # On error, use cached data if available
+                records = st.session_state.history_cache or []
+        
+        # Add a manual refresh button
+        col_refresh, col_info = st.columns([1, 5])
+        with col_refresh:
+            if st.button("🔄 刷新", key="refresh_history", help="手动刷新历史记录"):
+                st.session_state.history_cache = []
+                st.session_state.history_cache_time = 0
+                st.rerun()
+        with col_info:
+            if records:
+                # Format cache age nicely
+                # If cache is extremely old (> 1 day), treat it as stale and reset
+                if cache_age > 86400:  # > 1 day means stale session state
+                    st.session_state.history_cache_time = current_time
+                    cache_text = "已刷新"
+                elif st.session_state.history_cache_time == 0:
+                    cache_text = "已刷新"
+                elif cache_age < 3:
+                    cache_text = "刚刚"
+                elif cache_age < 60:
+                    cache_text = f"{int(cache_age)} 秒前"
+                elif cache_age < 3600:
+                    cache_text = f"{int(cache_age / 60)} 分钟前"
+                else:
+                    cache_text = f"{int(cache_age / 3600)} 小时前"
+                st.caption(f"共 {len(records)} 条记录 | {cache_text}")
 
         if not records:
             st.info("暂无分析历史记录")
@@ -496,10 +628,36 @@ def render_history_manager() -> Optional[str]:
 
         # Display history list
         selected_task_id = None
-        
-        # Pre-compute running tasks count and limit progress fetches to avoid N+1
-        running_tasks = [r for r in filtered_records if r.get("status") in ("PENDING", "RUNNING")]
-        progress_fetch_count = 0
+
+        # Configuration mappings
+        status_config = {
+            "PENDING": ("⏳", "等待中", "#FFA500"),
+            "RUNNING": ("🔄", "分析中", "#2196F3"),
+            "COMPLETED": ("✅", "完成", "#4CAF50"),
+            "FAILED": ("❌", "失败", "#F44336")
+        }
+
+        step_names = {
+            "graph_setup": "初始化分析图",
+            "research_manager": "研究经理",
+            "market_analyst": "市场分析师",
+            "sentiment_analyst": "情绪分析师",
+            "news_analyst": "新闻分析师",
+            "fundamentals_analyst": "基本面分析师",
+            "bull_researcher": "看涨研究员",
+            "bear_researcher": "看跌研究员",
+            "trader": "交易员",
+            "risk_manager": "风控经理",
+            "portfolio_manager": "投资组合经理",
+            "propagate": "多智能体分析"
+        }
+
+        decision_text_map = {
+            "BUY": ("买入", "#4CAF50"),
+            "SELL": ("卖出", "#F44336"),
+            "HOLD": ("持有", "#FF9800"),
+            "UNKNOWN": ("未知", "#9E9E9E")
+        }
 
         for idx, record in enumerate(filtered_records):
             task_id = record.get("task_id", "")
@@ -508,6 +666,9 @@ def render_history_manager() -> Optional[str]:
             updated_at = record.get("updated_at", "")
             status = record.get("status", "")
             decision = record.get("decision", "")
+            raw_result = record.get("raw_result", {}) or {}
+            if not isinstance(raw_result, dict):
+                raw_result = {}
 
             # Format date
             try:
@@ -516,125 +677,58 @@ def render_history_manager() -> Optional[str]:
             except Exception:
                 date_str = created_at[:16] if created_at else "Unknown"
 
-            # Status emoji and text
-            status_emoji = {
-                "PENDING": "⏳",
-                "RUNNING": "🔄",
-                "COMPLETED": "✅",
-                "FAILED": "❌"
-            }.get(status, "⚪")
-
-            # Translate decision to Chinese
-            decision_text_map = {
-                "BUY": "买入",
-                "SELL": "卖出",
-                "HOLD": "持有",
-                "UNKNOWN": "未知"
-            }
-            decision_cn = decision_text_map.get(decision, decision) if decision else ""
-
-            status_text = {
-                "PENDING": "等待中",
-                "RUNNING": "分析中",
-                "COMPLETED": decision_cn if decision_cn else "完成",
-                "FAILED": "失败"
-            }.get(status, status)
-
-            # Single row layout: symbol | status/progress | date | buttons
-            col1, col2, col3, col4, col5 = st.columns([1.5, 3, 1.2, 1, 1])
+            # Card layout: 4 columns [2, 2, 1.5, 1.5]
+            col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1.5])
 
             with col1:
-                st.write(f"**{symbol}**")
+                st.markdown(f"### 📊 {symbol}")
+                st.caption(f"🕐 {date_str}")
+
             with col2:
-                if status in ("PENDING", "RUNNING"):
-                    # Only fetch progress for first 3 running tasks to avoid N+1
-                    if progress_fetch_count < 3:
-                        progress_info = get_task_progress(task_id)
-                        progress_fetch_count += 1  # FIX: increment counter after fetch
-                        if progress_info:
-                            prog = progress_info.get("progress", 0)
-                            elapsed = progress_info.get("elapsed", 0)
-                            remaining = progress_info.get("remaining", 0)
-                            msg = progress_info.get("message", "")
-                            elapsed_str = format_duration(int(elapsed)) if isinstance(elapsed, (int, float)) else str(elapsed)
-                            
-                            # Show remaining time or overtime indicator
-                            # If progress is near 100%, treat as completed even if status hasn't updated yet
-                            if prog >= 99 or remaining > 0:
-                                if remaining > 0:
-                                    remaining_str = format_duration(int(remaining))
-                                    progress_text = f"📊 {int(prog)}% | ⏱️ {elapsed_str} | ⏳ 剩余: {remaining_str}"
-                                else:
-                                    # Progress near 100% or remaining = 0, task essentially complete
-                                    # Calculate actual duration from updated_at - created_at
-                                    # But if they are nearly identical (< 1 second), updated_at wasn't properly set
-                                    # Fall back to elapsed from progress_info
-                                    use_elapsed = True
-                                    if updated_at and created_at:
-                                        try:
-                                            created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                                            updated_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                                            actual_duration = (updated_dt - created_dt.replace(tzinfo=None)).total_seconds()
-                                            # Only use actual duration if > 1 second (updated_at was properly set)
-                                            if actual_duration > 1:
-                                                elapsed_str = format_duration(int(actual_duration))
-                                                use_elapsed = False
-                                        except Exception:
-                                            pass  # Fall through to use elapsed
-                                    if use_elapsed:
-                                        # updated_at wasn't set properly, use elapsed from progress_info
-                                        pass  # Keep original elapsed_str
-                                    progress_text = f"✅ 分析完成 | ⏱️ {elapsed_str}"
-                            else:
-                                # Task still in progress, show overtime warning
-                                is_running = status in ("PENDING", "RUNNING")
-                                overtime = elapsed > 600  # More than 10 minutes
-                                long_running = elapsed > 900  # More than 15 minutes
-                                if long_running and is_running:
-                                    progress_text = f"📊 {int(prog)}% | ⏱️ {elapsed_str} | 🔄 长时间运行中"
-                                elif overtime and is_running:
-                                    progress_text = f"📊 {int(prog)}% | ⏱️ {elapsed_str} | ⚠️ 超时运行中"
-                                else:
-                                    progress_text = f"📊 {int(prog)}% | ⏱️ {elapsed_str} | ⏳ 即将完成"
-                            
-                            st.progress(prog / 100, text=progress_text)
-                            if msg:
-                                st.caption(f"📍 {msg[:30]}...")
-                        else:
-                            st.write("🔄 分析中...")
-                    else:
-                        st.write("🔄 分析中...")
-                else:
-                    # Show duration for completed/failed tasks
-                    # Check if task actually failed (result has error)
-                    raw_result = record.get("raw_result", {}) or {}
-                    result_error = None
-                    if isinstance(raw_result, dict):
-                        result_error = raw_result.get("error")
+                if status == "RUNNING":
+                    # Get progress data from raw_result
+                    progress_pct = raw_result.get("progress_pct", 0) or 0
+                    current_agent = raw_result.get("current_agent", "")
+                    step_name = step_names.get(current_agent, current_agent) if current_agent else "分析中"
+                    st.progress(progress_pct / 100, text=f"{progress_pct}%")
+                    st.caption(f"🔄 {step_name}")
+                elif status == "COMPLETED":
+                    # Show decision with color
+                    decision_info = decision_text_map.get(decision, (decision, "#9E9E9E"))
+                    decision_text, decision_color = decision_info
                     
+                    # Check if task actually failed
+                    result_error = raw_result.get("error")
                     if result_error:
-                        # Task failed but status is COMPLETED
-                        st.write(f"❌ 分析失败")
+                        st.markdown(f"<span style='color: #F44336'>❌ 分析失败</span>", unsafe_allow_html=True)
                     else:
-                        # Normal completed task
-                        updated_at = record.get("updated_at", "")
+                        st.markdown(f"<span style='color: {decision_color}; font-weight: bold;'>{decision_text}</span>", unsafe_allow_html=True)
+                        
+                        # Show duration
                         duration_text = ""
                         if created_at and updated_at:
                             try:
                                 created_dt = datetime.fromisoformat(created_at)
                                 updated_dt = datetime.fromisoformat(updated_at)
                                 duration = (updated_dt - created_dt).total_seconds()
-                                duration_text = f" (⏱️ {format_duration(int(duration))})"
+                                duration_text = f"⏱️ 耗时: {format_duration(int(duration))}"
                             except Exception:
                                 pass
-                        st.write(f"{status_emoji} {status_text}{duration_text}")
+                        if duration_text:
+                            st.caption(duration_text)
+                elif status == "FAILED":
+                    st.markdown(f"<span style='color: #F44336'>❌ 失败</span>", unsafe_allow_html=True)
+                else:
+                    # PENDING
+                    status_emoji, status_text, _ = status_config.get(status, ("⚪", status, "#9E9E9E"))
+                    st.write(f"{status_emoji} {status_text}")
+
             with col3:
-                st.caption(date_str)
-            with col4:
-                if st.button("查看", key=f"view_{task_id}", help="查看详情", use_container_width=True):
+                if st.button("👁️ 查看", key=f"view_{task_id}", help="查看详情", use_container_width=True):
                     selected_task_id = task_id
-            with col5:
-                if st.button("删除", key=f"del_{task_id}", help="删除记录", use_container_width=True):
+
+            with col4:
+                if st.button("🗑️ 删除", key=f"del_{task_id}", help="删除记录", use_container_width=True):
                     delete_from_history(task_id)
                     st.rerun()
 
@@ -803,61 +897,181 @@ def render_history_detail(task_id: str):
 
         st.divider()
 
-        # Decision section
-        decision_colors = {
-            "BUY": "green",
-            "SELL": "red",
-            "HOLD": "orange",
-            "UNKNOWN": "gray"
-        }
+        # Real-time progress section (only for PENDING/RUNNING tasks)
+        if status in ("PENDING", "RUNNING"):
+            st.subheader("🔄 实时分析进度")
+            
+            # Get progress data from result_data
+            agents_progress = result_data.get("agents_progress", {})
+            current_agent = result_data.get("current_agent", "")
+            progress_pct = result_data.get("progress_pct", 0)
+            elapsed_time = result_data.get("elapsed_time", 0) or 0
+            remaining_time = result_data.get("remaining_time", 0) or 0
+            
+            # Display overall progress
+            st.progress(progress_pct / 100, text=f"整体进度: {progress_pct}%")
+            
+            # Time metrics
+            col1, col2 = st.columns(2)
+            with col1:
+                st.caption(f"⏱️ 已用时间: {format_time(elapsed_time)}")
+            with col2:
+                st.caption(f"⏳ 预计剩余: {format_time(remaining_time)}")
+            
+            # Define the 11 analysis steps
+            steps = [
+                ("graph_setup", "🚀", "初始化分析图"),
+                ("research_manager", "🔍", "研究经理"),
+                ("market_analyst", "📊", "市场分析师"),
+                ("sentiment_analyst", "💭", "情绪分析师"),
+                ("news_analyst", "📰", "新闻分析师"),
+                ("fundamentals_analyst", "🏢", "基本面分析师"),
+                ("bull_researcher", "🐂", "看涨研究员"),
+                ("bear_researcher", "🐻", "看跌研究员"),
+                ("trader", "💼", "交易员"),
+                ("risk_manager", "⚠️", "风控经理"),
+                ("portfolio_manager", "👔", "投资组合经理"),
+            ]
+            
+            # Determine step status based on agents_progress
+            # completed -> ✅, in_progress -> 🔄, failed -> ❌, not_started -> ⏳
+            def get_step_status(step_id):
+                step_status = agents_progress.get(step_id, "not_started")
+                if step_status == "completed":
+                    return "✅"
+                elif step_status == "in_progress":
+                    return "🔄"
+                elif step_status == "failed":
+                    return "❌"
+                return "⏳"
+            
+            # Display steps in a timeline layout using columns (3 rows: 4+4+3)
+            cols = st.columns(4)
+            step_icons = []
+            for i, (step_id, emoji, step_name) in enumerate(steps):
+                status_icon = get_step_status(step_id)
+                is_current = (step_id == current_agent)
+                marker = " >>>" if is_current else ""
+                step_icons.append(f"{status_icon} {emoji} {step_name}{marker}")
+            
+            # Show first row (4 steps)
+            for i, text in enumerate(step_icons[:4]):
+                with cols[i]:
+                    st.write(text)
+            
+            # Show second row (4 steps)
+            cols2 = st.columns(4)
+            for i, text in enumerate(step_icons[4:8]):
+                with cols2[i]:
+                    st.write(text)
+            
+            # Show third row (3 steps)
+            cols3 = st.columns(4)
+            for i, text in enumerate(step_icons[8:]):
+                with cols3[i]:
+                    st.write(text)
+            
+            # Generate activity logs based on agents_progress
+            st.subheader("📋 活动日志")
+            logs = []
+            logs.append(f"[{date_str}] 任务已启动")
+            
+            # Add logs for each completed agent
+            for step_id, emoji, step_name in steps:
+                step_status = agents_progress.get(step_id, "not_started")
+                if step_status == "completed":
+                    logs.append(f"[{date_str}] ✅ {step_name} 已完成")
+                elif step_status == "in_progress":
+                    logs.append(f"[{date_str}] 🔄 正在执行: {step_name}")
+                elif step_status == "failed":
+                    logs.append(f"[{date_str}] ❌ {step_name} 执行失败")
+            
+            # Highlight current agent
+            if current_agent:
+                for step_id, emoji, step_name in steps:
+                    if step_id == current_agent:
+                        logs.append(f"[{date_str}] >>> 正在执行: {step_name}")
+                        break
+            
+            logs_text = "\n".join(logs)
+            st.code(logs_text, language=None)
+            
+            # Refresh controls
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("🔄 刷新进度", key=f"refresh_{task_id}"):
+                    st.rerun()
+            with col2:
+                auto_refresh_key = f"auto_refresh_{task_id}"
+                default_value = st.session_state.get(auto_refresh_key, True)
+                auto_refresh = st.checkbox("🔄 自动刷新", value=default_value, key=auto_refresh_key)
+                if auto_refresh and status == "RUNNING":
+                    import time
+                    time.sleep(3)
+                    st.rerun()
+        else:
+            # Decision section for completed/failed tasks
+            decision_colors = {
+                "BUY": "green",
+                "SELL": "red",
+                "HOLD": "orange",
+                "UNKNOWN": "gray"
+            }
 
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            st.subheader("📈 交易建议")
-            if analysis_error:
-                st.error("❌ 分析失败")
-            else:
-                decision_text = {"BUY": "买入", "SELL": "卖出", "HOLD": "持有"}.get(decision, decision)
-                color = decision_colors.get(decision, "gray")
-                st.markdown(f"### <span style='color: {color}'>{decision_text}</span>", unsafe_allow_html=True)
-        with col2:
-            st.subheader("📊 置信度")
-            if analysis_error:
-                with st.expander("查看错误详情"):
-                    st.code(analysis_error, language=None)
-            elif confidence > 0:
-                st.progress(confidence / 100, text=f"{confidence}%")
-            else:
-                st.info("计算中...")
-        with col3:
-            st.subheader("⚠️ 风险等级")
-            if analysis_error:
-                st.write("未知")
-            elif risk_level:
-                st.write(risk_level)
-            else:
-                st.write("中等")
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col1:
+                st.subheader("📈 交易建议")
+                if analysis_error:
+                    st.error("❌ 分析失败")
+                else:
+                    decision_text = {"BUY": "买入", "SELL": "卖出", "HOLD": "持有"}.get(decision, decision)
+                    color = decision_colors.get(decision, "gray")
+                    st.markdown(f"### <span style='color: {color}'>{decision_text}</span>", unsafe_allow_html=True)
+            with col2:
+                st.subheader("📊 置信度")
+                if analysis_error:
+                    with st.expander("查看错误详情"):
+                        st.code(analysis_error, language=None)
+                elif confidence > 0:
+                    st.progress(confidence / 100, text=f"{confidence}%")
+                else:
+                    st.info("计算中...")
+            with col3:
+                st.subheader("⚠️ 风险等级")
+                if analysis_error:
+                    st.write("未知")
+                elif risk_level:
+                    st.write(risk_level)
+                else:
+                    st.write("中等")
 
-        st.divider()
+            st.divider()
 
         # Show reports in tabs for better readability
-        if api_data and final_state:
-            tabs_to_show = []
+        # Get final_state from either API or local data
+        final_state_for_tabs = None
+        if api_data and api_data.get("final_state"):
+            final_state_for_tabs = api_data["final_state"]
+        elif result_data and result_data.get("final_state"):
+            final_state_for_tabs = result_data["final_state"]
 
-            if final_state.get("market_report"):
-                tabs_to_show.append(("📊 市场分析", final_state.get("market_report", "")))
-            if final_state.get("sentiment_report"):
-                tabs_to_show.append(("💭 情绪分析", final_state.get("sentiment_report", "")))
-            if final_state.get("news_report"):
-                tabs_to_show.append(("📰 新闻分析", final_state.get("news_report", "")))
-            if final_state.get("fundamentals_report"):
-                tabs_to_show.append(("🏢 基本面", final_state.get("fundamentals_report", "")))
+        if final_state_for_tabs:
+            # Report tabs mapping
+            reports = {
+                'final_trade_decision': '🎯 最终交易决策',
+                'fundamentals_report': '💰 基本面分析',
+                'market_report': '📈 市场分析',
+                'sentiment_report': '💭 情绪分析',
+                'news_report': '📰 新闻分析',
+                'risk_assessment_report': '⚠️ 风险评估'
+            }
 
-            if len(tabs_to_show) > 0:
-                tabs = st.tabs([t[0] for t in tabs_to_show])
-                for i, (label, content) in enumerate(tabs_to_show):
-                    with tabs[i]:
-                        st.markdown(content)
+            available_reports = {k: v for k, v in reports.items() if k in final_state_for_tabs and final_state_for_tabs[k]}
+            if available_reports:
+                tabs = st.tabs(list(available_reports.values()))
+                for i, (tab, (report_key, report_name)) in enumerate(zip(tabs, available_reports.items())):
+                    with tab:
+                        st.markdown(final_state_for_tabs[report_key])
 
         # Show summary as markdown if available (outside tabs)
         if summary:
@@ -901,3 +1115,17 @@ def render_history_detail(task_id: str):
     except Exception:
         traceback.print_exc(file=sys.stderr)
         st.error("历史详情页面加载失败，请稍后重试")
+
+
+def format_time(seconds: int) -> str:
+    """格式化秒数为可读时间"""
+    if seconds < 60:
+        return f"{seconds}秒"
+    elif seconds < 3600:
+        mins = seconds // 60
+        secs = seconds % 60
+        return f"{mins}分{secs}秒"
+    else:
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        return f"{hours}小时{mins}分"

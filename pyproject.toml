@@ -37,9 +37,20 @@ dependencies = [
 
 [project.scripts]
 tradingagents = "cli.main:app"
+tradingagents-web = "web.app:main"
+tradingagents-api = "webapi.server:main"
+
+[project.optional-dependencies]
+web = [
+    "streamlit>=1.32.0",
+    "plotly>=5.18.0",
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "sse-starlette>=2.0.0",
+]
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingagents*", "cli*", "webapi*", "web*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]

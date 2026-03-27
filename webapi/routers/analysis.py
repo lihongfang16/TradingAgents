@@ -65,34 +65,65 @@ async def list_analyses(
 
 @router.post("/batch", response_model=BatchAnalysisResponse)
 async def batch_analysis(request: BatchAnalysisRequest):
-    """Create batch analysis for multiple symbols"""
-    return analysis_service.create_batch_task(request)
+    """Create and run batch analysis for multiple symbols"""
+    # Use run_batch which creates tasks AND starts execution
+    return await analysis_service.run_batch(request)
 
 
 @router.get("/{task_id}/progress")
 async def get_progress(task_id: str):
-    """SSE stream for real-time progress updates"""
+    """SSE stream for real-time progress updates with agent-level tracking"""
     async def event_generator() -> AsyncGenerator[dict, None]:
         task = analysis_service.get_task(task_id)
         if not task:
             yield {"event": "error", "data": json.dumps({"error": "Task not found"})}
             return
-        
-        # Calculate progress based on status and elapsed time
+
+        # Stream real-time progress using tracked fields
         while task and task.status in (AnalysisStatus.PENDING, AnalysisStatus.RUNNING):
-            progress_data = analysis_service.get_task_progress(task_id)
+            progress_data = {
+                "task_id": task_id,
+                "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+                "symbol": task.symbol,
+                "agents_progress": task.agents_progress or {},
+                "current_agent": task.current_agent or "",
+                "progress_pct": task.progress_pct or 0,
+                "message": task.message or "",
+                "logs": task.logs or [],
+                "done": False,
+            }
             yield {
                 "event": "progress",
-                "data": json.dumps(progress_data or {}),
+                "data": json.dumps(progress_data),
             }
             await asyncio.sleep(2)
             task = analysis_service.get_task(task_id)
+
+        # Final status - include full result
+        final_task = analysis_service.get_task(task_id)
+        if final_task is None:
+            # Task was deleted mid-stream
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": "Task not found", "done": True}),
+            }
+            return
         
-        # Final status
-        final_data = analysis_service.get_task_progress(task_id)
+        final_data = {
+            "task_id": task_id,
+            "status": final_task.status.value if hasattr(final_task.status, 'value') else str(final_task.status),
+            "symbol": final_task.symbol,
+            "agents_progress": final_task.agents_progress or {},
+            "current_agent": final_task.current_agent or "",
+            "progress_pct": 100,
+            "message": final_task.message or "",
+            "logs": final_task.logs or [],
+            "result": final_task.result,
+            "done": True,
+        }
         yield {
             "event": "complete",
-            "data": json.dumps(final_data or {}),
+            "data": json.dumps(final_data),
         }
-    
+
     return EventSourceResponse(event_generator())

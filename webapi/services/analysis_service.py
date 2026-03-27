@@ -12,7 +12,7 @@ import os
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 # Load environment variables from .env file
@@ -40,7 +40,7 @@ from webapi.models.analysis import (
     BatchAnalysisRequest,
     BatchAnalysisResponse,
 )
-from webapi.models.database import AnalysisTask
+from webapi.models.database import AnalysisTask, AnalysisBatch
 from webapi.config.database import SessionLocal
 
 # Import local history persistence (no API dependencies)
@@ -54,6 +54,45 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
     # Extract decision from result.signal if available
     result_data = task.result if task.result else None
 
+    # For running/pending tasks, include real-time progress data
+    if task.status in (AnalysisStatus.PENDING.value, AnalysisStatus.RUNNING.value):
+        if not isinstance(result_data, dict):
+            result_data = {}
+        result_data.update({
+            "agents_progress": task.agents_progress or {},
+            "current_agent": task.current_agent or "",
+            "progress_pct": task.progress_pct or 0,
+        })
+
+    # Add elapsed_time and remaining_time for running tasks
+    if task.created_at:
+        elapsed_seconds = int(
+            (
+                datetime.now(timezone.utc)
+                - task.created_at.replace(tzinfo=timezone.utc)
+            ).total_seconds()
+        )
+
+        # Estimate remaining time based on progress
+        progress_pct = result_data.get("progress_pct", 0) if isinstance(result_data, dict) else 0
+        if progress_pct > 0 and progress_pct < 100:
+            estimated_total = int(elapsed_seconds * 100 / progress_pct)
+            remaining_seconds = max(0, estimated_total - elapsed_seconds)
+            remaining_time = remaining_seconds
+        else:
+            remaining_time = 0
+    else:
+        elapsed_seconds = 0
+        remaining_time = 0
+
+    # Keep elapsed/remaining time available in result_data for UI paths
+    # that read result_data.get("elapsed_time") / result_data.get("remaining_time").
+    if not isinstance(result_data, dict):
+        result_data = {}
+    result_data["elapsed_time"] = elapsed_seconds
+    result_data["remaining_time"] = remaining_time
+
+    # Return AnalysisResponse with time fields populated
     return AnalysisResponse(
         task_id=task.task_id,
         status=AnalysisStatus(task.status),
@@ -64,7 +103,27 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
         completed_at=task.completed_at.isoformat() if task.completed_at else None,
         result=result_data,
         error=task.error,
-        logs=[],  # logs are not persisted in DB
+        logs=task.logs if task.logs else [],  # logs from DB
+        agents_progress=task.agents_progress,
+        current_agent=task.current_agent,
+        progress_pct=task.progress_pct,
+        elapsed_time=elapsed_seconds,
+        remaining_time=remaining_time,
+    )
+
+
+def _batch_orm_to_response(batch: AnalysisBatch, tasks: List[AnalysisResponse]) -> BatchAnalysisResponse:
+    """Convert an AnalysisBatch ORM row to a BatchAnalysisResponse Pydantic model."""
+    return BatchAnalysisResponse(
+        batch_id=batch.batch_id,
+        total=batch.total,
+        completed_count=batch.completed_count,
+        failed_count=batch.failed_count,
+        status=AnalysisStatus(batch.status),
+        created_at=batch.created_at.isoformat() if batch.created_at else None,
+        updated_at=batch.updated_at.isoformat() if batch.updated_at else None,
+        completed_at=batch.completed_at.isoformat() if batch.completed_at else None,
+        tasks=tasks,
     )
 
 
@@ -409,6 +468,56 @@ class AnalysisService:
 
         return task_resp
 
+    def _update_task_progress(self, task_id: str, progress_data: Dict[str, Any]):
+        """Update task progress in database using targeted column update.
+        
+        Uses column-only UPDATE to avoid race conditions with the main thread
+        that may be writing the final result.
+        
+        Args:
+            task_id: UUID of the task
+            progress_data: Dict containing agents_progress, current_agent, progress_pct, message, timestamp
+        """
+        db = SessionLocal()
+        try:
+            # First check if task is still running (don't overwrite completed results)
+            task_status = db.query(AnalysisTask.status).filter(
+                AnalysisTask.task_id == task_id
+            ).scalar()
+            
+            # Only update progress if task is still running
+            if task_status in ("PENDING", "RUNNING"):
+                # Append to logs - need to fetch current logs first
+                current_logs = db.query(AnalysisTask.logs).filter(
+                    AnalysisTask.task_id == task_id
+                ).scalar() or []
+                
+                new_log = {
+                    "timestamp": progress_data.get("timestamp"),
+                    "agent": progress_data.get("current_agent"),
+                    "progress": progress_data.get("progress_pct"),
+                    "message": progress_data.get("message", ""),
+                }
+                updated_logs = (current_logs + [new_log])[-100:]
+                
+                # Use targeted column update to avoid race condition
+                db.query(AnalysisTask).filter(
+                    AnalysisTask.task_id == task_id
+                ).update({
+                    "agents_progress": progress_data.get("agents_progress", {}),
+                    "current_agent": progress_data.get("current_agent", ""),
+                    "progress_pct": progress_data.get("progress_pct", 0),
+                    "updated_at": datetime.utcnow(),
+                    "logs": updated_logs,
+                }, synchronize_session=False)
+                
+                db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning(f"Error updating task progress: {e}")
+        finally:
+            db.close()
+
     def _run_sync_analysis(
         self, task_id: str, request: AnalysisRequest
     ) -> Dict[str, Any]:
@@ -428,35 +537,36 @@ class AnalysisService:
             date = request.date or datetime.now().strftime("%Y-%m-%d")
 
             # Determine LLM model and provider
-            llm_provider = request.llm_provider or "openai"
+            # Priority: request params > env vars > model-name heuristic
+            llm_provider = request.llm_provider or os.getenv("LLM_PROVIDER", "openai")
 
-            # Map minimax to openai with custom base_url
+            # Determine model
+            deep_model = request.deep_model or os.getenv("DEEP_THINK_LLM", "gpt-4")
+            quick_model = request.quick_model or os.getenv("QUICK_THINK_LLM", "gpt-4")
+
+            # Auto-detect provider from model name if provider is generic "openai"
+            # but model is clearly a non-OpenAI model (e.g. MiniMax, Gemini)
+            if llm_provider.lower() == "openai" and not request.llm_provider:
+                model_lower = (deep_model + " " + quick_model).lower()
+                if "minimax" in model_lower:
+                    llm_provider = "minimax"
+
+            # Map minimax to openai-compatible with custom base_url
             base_url = None
             api_key = None
             if llm_provider.lower() == "minimax":
                 base_url = os.environ.get("MINIMAX_API_BASE", "https://api.minimax.chat/v1")
-                llm_provider = "openai"
-                # Get API key without mutating global state
+                llm_provider = "openai"  # MiniMax uses OpenAI-compatible API
                 api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
-                print(f"[API_KEY_TRACE] analysis_service: api_key length = {len(api_key) if api_key else 0}", flush=True)
+                deep_model = request.deep_model or os.getenv("DEEP_THINK_LLM", "MiniMax-M2.7")
+                quick_model = request.quick_model or os.getenv("QUICK_THINK_LLM", "MiniMax-M2.7")
+                print(f"[API_KEY_TRACE] analysis_service: minimax mode, api_key length = {len(api_key) if api_key else 0}", flush=True)
 
-            # Determine model (use MiniMax default for minimax, gpt-4 for openai)
-            if base_url and "minimax" in base_url.lower():
-                llm_model = request.deep_model or request.quick_model or "MiniMax-M2.7"
-            else:
-                llm_model = request.deep_model or request.quick_model or "gpt-4"
-
-            # Always get API key for custom base_url (MiniMax compatibility)
-            if not api_key and base_url:
-                api_key = os.getenv("OPENAI_API_KEY")
-                print(f"[API_KEY_TRACE] analysis_service (base_url): api_key length = {len(api_key) if api_key else 0}", flush=True)
-
-            # Debug: print llm_provider
-            print(f"[DEBUG] llm_provider={llm_provider}, llm_model={llm_model}, base_url={base_url}, api_key_present={bool(api_key)}", flush=True)
+            llm_model = deep_model
 
             analysts = request.analysts or ["market", "news", "fundamentals"]
 
-            # Create runner instance
+            # Create runner instance with progress callback
             runner = AnalysisRunner(
                 symbol=symbol,
                 date=date,
@@ -466,6 +576,7 @@ class AnalysisService:
                 max_iterations=300,
                 base_url=base_url,
                 api_key=api_key,
+                progress_callback=lambda data: self._update_task_progress(task_id, data),
             )
 
             # Run analysis
@@ -508,9 +619,11 @@ class AnalysisService:
             BatchAnalysisResponse with all task results
         """
         batch_id = str(uuid.uuid4())
+        now = datetime.utcnow()
 
         # Create individual tasks for each symbol (persists to DB)
         tasks = []
+        task_ids = []
         for symbol in request.symbols:
             single_request = AnalysisRequest(
                 symbol=symbol,
@@ -521,6 +634,29 @@ class AnalysisService:
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
+            task_ids.append(task_response.task_id)
+
+        # Persist batch metadata to database
+        db = SessionLocal()
+        try:
+            batch = AnalysisBatch(
+                batch_id=batch_id,
+                total=len(request.symbols),
+                completed_count=0,
+                failed_count=0,
+                status=AnalysisStatus.RUNNING.value,
+                created_at=now,
+                task_ids=task_ids,
+                symbols=request.symbols,
+                message=f"Batch analysis started for {len(request.symbols)} symbols",
+            )
+            db.add(batch)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         # Create batch response
         batch_response = BatchAnalysisResponse(
@@ -528,9 +664,9 @@ class AnalysisService:
             total=len(request.symbols),
             tasks=tasks,
             status=AnalysisStatus.RUNNING,
-            created_at=datetime.now().isoformat(),
+            created_at=now.isoformat(),
         )
-        self._batch_tasks[batch_id] = batch_response
+        self._batch_tasks[batch_id] = batch_response  # Keep for backward compatibility
 
         # Run all tasks concurrently
         async def run_single(tid: str, req: AnalysisRequest):
@@ -549,17 +685,48 @@ class AnalysisService:
 
         results = await asyncio.gather(*coroutines, return_exceptions=True)
 
-        # Update batch status
+        # Calculate final counts
+        failed_count = sum(1 for r in results if isinstance(r, Exception) or (
+            hasattr(r, 'status') and r.status == AnalysisStatus.FAILED
+        ))
+        completed_count = len(results) - failed_count
+        final_status = AnalysisStatus.FAILED if failed_count == len(results) else AnalysisStatus.COMPLETED
+        completed_at = datetime.utcnow()
+
+        # Update batch in database
+        db = SessionLocal()
+        try:
+            db_batch = db.query(AnalysisBatch).filter(
+                AnalysisBatch.batch_id == batch_id
+            ).first()
+            if db_batch:
+                db_batch.completed_count = completed_count
+                db_batch.failed_count = failed_count
+                db_batch.status = final_status.value
+                db_batch.updated_at = completed_at
+                db_batch.completed_at = completed_at
+                db_batch.message = f"Batch completed: {completed_count} succeeded, {failed_count} failed"
+                db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        # Update batch response
         batch_response.tasks = results
-        failed_count = sum(1 for r in results if isinstance(r, Exception) or r.status == AnalysisStatus.FAILED)
-        batch_response.status = AnalysisStatus.FAILED if failed_count == len(results) else AnalysisStatus.COMPLETED
+        batch_response.completed_count = completed_count
+        batch_response.failed_count = failed_count
+        batch_response.status = final_status
+        batch_response.updated_at = completed_at.isoformat()
+        batch_response.completed_at = completed_at.isoformat()
 
         self._batch_tasks[batch_id] = batch_response
         return batch_response
 
     def get_batch(self, batch_id: str) -> Optional[BatchAnalysisResponse]:
         """
-        Retrieve a batch by its ID.
+        Retrieve a batch by its ID from the database.
 
         Args:
             batch_id: UUID of the batch to retrieve
@@ -567,6 +734,25 @@ class AnalysisService:
         Returns:
             BatchAnalysisResponse if found, None otherwise
         """
+        # Try to get from database first
+        db = SessionLocal()
+        try:
+            db_batch = db.query(AnalysisBatch).filter(
+                AnalysisBatch.batch_id == batch_id
+            ).first()
+            if db_batch:
+                # Get all associated tasks
+                tasks = []
+                if db_batch.task_ids:
+                    for task_id in db_batch.task_ids:
+                        task_resp = self.get_task(task_id)
+                        if task_resp:
+                            tasks.append(task_resp)
+                return _batch_orm_to_response(db_batch, tasks)
+        finally:
+            db.close()
+
+        # Fallback to in-memory for backward compatibility
         return self._batch_tasks.get(batch_id)
 
     def cancel_task(self, task_id: str) -> bool:
@@ -612,9 +798,11 @@ class AnalysisService:
     def create_batch_task(self, request: BatchAnalysisRequest) -> BatchAnalysisResponse:
         """Create a batch task (synchronous wrapper for run_batch)."""
         batch_id = str(uuid.uuid4())
+        now = datetime.utcnow()
 
         # Create individual tasks for each symbol (persists to DB)
         tasks = []
+        task_ids = []
         for symbol in request.symbols:
             single_request = AnalysisRequest(
                 symbol=symbol,
@@ -625,14 +813,39 @@ class AnalysisService:
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
+            task_ids.append(task_response.task_id)
+
+        # Persist batch metadata to database
+        db = SessionLocal()
+        try:
+            batch = AnalysisBatch(
+                batch_id=batch_id,
+                total=len(request.symbols),
+                completed_count=0,
+                failed_count=0,
+                status=AnalysisStatus.RUNNING.value,
+                created_at=now,
+                task_ids=task_ids,
+                symbols=request.symbols,
+                message=f"Batch analysis created for {len(request.symbols)} symbols",
+            )
+            db.add(batch)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
         # Create batch response
         batch_response = BatchAnalysisResponse(
             batch_id=batch_id,
             total=len(request.symbols),
+            completed_count=0,
+            failed_count=0,
             tasks=tasks,
             status=AnalysisStatus.RUNNING,
-            created_at=datetime.now().isoformat(),
+            created_at=now.isoformat(),
         )
         self._batch_tasks[batch_id] = batch_response
         return batch_response

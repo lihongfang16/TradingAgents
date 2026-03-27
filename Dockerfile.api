@@ -1,0 +1,34 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements files
+COPY requirements.txt requirements-web.txt ./
+
+# Install Python dependencies (use Tsinghua mirror)
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt -r requirements-web.txt
+
+# Copy application code - preserve directory structure
+COPY cli /app/cli
+COPY tradingagents /app/tradingagents
+COPY webapi /app/webapi
+COPY pyproject.toml /app/
+
+# Install the package in editable mode (use Tsinghua mirror)
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -e /app
+
+# Expose API port
+EXPOSE 8000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the API
+CMD ["uvicorn", "webapi.server:app", "--host", "0.0.0.0", "--port", "8000"]
