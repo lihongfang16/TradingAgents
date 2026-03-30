@@ -5,7 +5,8 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from webapi.routers import analysis
+from webapi.routers import analysis, watchlist
+from webapi.services.scheduler_service import WatchlistScheduler
 
 # Load environment variables from .env file
 # Find project root (where .env file is located)
@@ -18,6 +19,9 @@ if os.path.exists(env_path):
 else:
     # Fallback: try loading from current working directory
     load_dotenv()
+
+
+scheduler = WatchlistScheduler()
 
 
 def create_app() -> FastAPI:
@@ -39,12 +43,25 @@ def create_app() -> FastAPI:
     
     # Include routers
     app.include_router(analysis.router)
+    app.include_router(watchlist.router)
     
     return app
 
 
 # Create app instance
 app = create_app()
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    """Restore scheduler monitoring state on API startup."""
+    scheduler.restore_state()
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    """Stop scheduler on API shutdown."""
+    scheduler.stop()
 
 
 @app.get("/")
