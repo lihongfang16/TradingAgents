@@ -1,4 +1,4 @@
-from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction
 
 
 def create_portfolio_manager(llm, memory):
@@ -50,7 +50,7 @@ def create_portfolio_manager(llm, memory):
 
 ---
 
-要果断，每个结论都要基于分析师的具体证据。"""
+要果断，每个结论都要基于分析师的具体证据。{get_language_instruction()}"""
 
         response = llm.invoke(prompt)
 
