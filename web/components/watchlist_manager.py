@@ -31,8 +31,9 @@ def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
         from tradingagents.dataflows.ashare_provider import AshareProvider
         provider = AshareProvider()
 
-        # Try to get intraday kline data first
-        df = provider.get_kline(symbol, period="1m", limit=240)
+        # Try to get intraday kline data first - fetch more data to cover
+        # the analysis history window (5 days of 5m data = ~240 bars per day)
+        df = provider.get_kline(symbol, period="5m", limit=480)
 
         if df is not None and not df.empty:
             # Filter out non-trading periods (volume=0) to remove weekends/holidays
@@ -60,13 +61,94 @@ def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
         return None
 
 
-def render_candlestick_chart(df: pd.DataFrame, title: str = "", height: int = 300):
-    """Render a candlestick chart using Plotly.
+def add_trade_trajectory(fig, analysis_data: List[Dict], df: pd.DataFrame) -> None:
+    """Add trading trajectory lines between BUY and SELL signals.
+
+    Args:
+        fig: Plotly figure object to add traces to
+        analysis_data: List of analysis history items with signal data
+        df: DataFrame with price data for timestamp matching
+    """
+    import plotly.graph_objects as go
+
+    if not analysis_data or df.empty:
+        return
+
+    # Sort analysis data by timestamp
+    sorted_data = sorted(analysis_data, key=lambda x: x.get("timestamp", ""))
+
+    # Find BUY-SELL pairs
+    buy_signals = []
+    for item in sorted_data:
+        signal = item.get("signal", "")
+        if signal == "BUY":
+            buy_signals.append(item)
+        elif signal == "SELL" and buy_signals:
+            # Match with most recent unmatched BUY (LIFO)
+            buy_item = buy_signals.pop()
+
+            # Parse timestamps
+            try:
+                buy_ts = pd.to_datetime(buy_item.get("timestamp"))
+                sell_ts = pd.to_datetime(item.get("timestamp"))
+
+                # Find matching indices in df (use 5 min tolerance like markers)
+                buy_idx = None
+                sell_idx = None
+                for i, idx in enumerate(df.index):
+                    if abs((idx - buy_ts).total_seconds()) < 300:  # Within 5 minutes
+                        buy_idx = i
+                    if abs((idx - sell_ts).total_seconds()) < 300:
+                        sell_idx = i
+
+                if buy_idx is not None and sell_idx is not None and buy_idx < sell_idx:
+                    # Use price from analysis data, or fallback to candle close price
+                    buy_price = buy_item.get("price")
+                    if buy_price is None:
+                        buy_price = df.iloc[buy_idx]["close"]
+                    sell_price = item.get("price")
+                    if sell_price is None:
+                        sell_price = df.iloc[sell_idx]["close"]
+
+                    # Calculate profit/loss
+                    pnl_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+
+                    # Determine line style based on profit
+                    is_profit = sell_price > buy_price
+                    line_color = "#4CAF50" if is_profit else "#F44336"
+                    line_dash = "solid" if is_profit else "dash"
+
+                    # Add trajectory line
+                    fig.add_trace(go.Scatter(
+                        x=[buy_idx, sell_idx],
+                        y=[buy_price, sell_price],
+                        mode="lines",
+                        line=dict(
+                            color=line_color,
+                            width=2,
+                            dash=line_dash
+                        ),
+                        hoverinfo="text",
+                        hovertext=f"Trade: BUY→SELL<br>Entry: ¥{buy_price:.2f}<br>Exit: ¥{sell_price:.2f}<br>P/L: {pnl_pct:+.2f}%",
+                        showlegend=False
+                    ))
+            except Exception:
+                pass  # Skip this pair if parsing fails
+
+
+def render_candlestick_chart(
+    df: pd.DataFrame,
+    title: str = "",
+    height: int = 300,
+    analysis_data: Optional[List[Dict]] = None
+):
+    """Render a candlestick chart using Plotly with optional signal overlays.
 
     Args:
         df: DataFrame with DatetimeIndex and open/high/low/close/volume columns
         title: Chart title
         height: Chart height in pixels
+        analysis_data: Optional list of analysis history items for signal overlay
     """
     import plotly.graph_objects as go
 
@@ -92,6 +174,172 @@ def render_candlestick_chart(df: pd.DataFrame, title: str = "", height: int = 30
         increasing_line_color='#ef5350',  # A-share red = up
         decreasing_line_color='#26a69a',  # A-share green = down
     )])
+
+    # Add signal markers if analysis data is provided
+    if analysis_data:
+        # Prepare marker data for all 5 signal types
+        buy_x, buy_y, buy_text = [], [], []
+        overweight_x, overweight_y, overweight_text = [], [], []
+        hold_x, hold_y, hold_text = [], [], []
+        underweight_x, underweight_y, underweight_text = [], [], []
+        sell_x, sell_y, sell_text = [], [], []
+
+        for item in analysis_data:
+            signal = item.get("signal", "")
+            timestamp = item.get("timestamp", "")
+            price = item.get("price")
+            confidence = item.get("confidence", 0)
+
+            if not timestamp:
+                continue
+
+            try:
+                # Parse timestamp and find matching index in df
+                item_ts = pd.to_datetime(timestamp)
+
+                # Find closest index in df
+                closest_idx = None
+                min_diff = float('inf')
+                for i, idx in enumerate(df.index):
+                    diff = abs((idx - item_ts).total_seconds())
+                    if diff < min_diff:
+                        min_diff = diff
+                        closest_idx = i
+
+                if closest_idx is None or min_diff > 300:  # Skip if more than 5 minutes off
+                    continue
+
+                # Determine y position based on signal type
+                if signal == "BUY":
+                    # Position at high + small offset
+                    y_pos = df.iloc[closest_idx]["high"] * 1.002 if price is None else price * 1.002
+                    buy_x.append(closest_idx)
+                    buy_y.append(y_pos)
+                    conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
+                    buy_text.append(f"BUY<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"BUY<br>{conf_str}")
+                elif signal == "SELL":
+                    # Position at low - small offset
+                    y_pos = df.iloc[closest_idx]["low"] * 0.998 if price is None else price * 0.998
+                    sell_x.append(closest_idx)
+                    sell_y.append(y_pos)
+                    conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
+                    sell_text.append(f"SELL<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"SELL<br>{conf_str}")
+                elif signal == "OVERWEIGHT":
+                    # Position at high + small offset (similar to BUY but less aggressive)
+                    y_pos = df.iloc[closest_idx]["high"] * 1.001 if price is None else price * 1.001
+                    overweight_x.append(closest_idx)
+                    overweight_y.append(y_pos)
+                    conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
+                    overweight_text.append(f"增持<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"增持<br>{conf_str}")
+                elif signal == "HOLD":
+                    # Position at close
+                    y_pos = df.iloc[closest_idx]["close"] if price is None else price
+                    hold_x.append(closest_idx)
+                    hold_y.append(y_pos)
+                    conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
+                    hold_text.append(f"HOLD<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"HOLD<br>{conf_str}")
+                elif signal == "UNDERWEIGHT":
+                    # Position at low - small offset (similar to SELL but less aggressive)
+                    y_pos = df.iloc[closest_idx]["low"] * 0.999 if price is None else price * 0.999
+                    underweight_x.append(closest_idx)
+                    underweight_y.append(y_pos)
+                    conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
+                    underweight_text.append(f"减持<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"减持<br>{conf_str}")
+            except Exception:
+                continue  # Skip items that fail to parse
+
+        # Add BUY markers (green triangle-up)
+        if buy_x:
+            fig.add_trace(go.Scatter(
+                x=buy_x,
+                y=buy_y,
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=14,
+                    color="#4CAF50",
+                    line=dict(width=1, color="white")
+                ),
+                hoverinfo="text",
+                hovertext=buy_text,
+                name="BUY",
+                showlegend=False
+            ))
+
+        # Add SELL markers (red triangle-down)
+        if sell_x:
+            fig.add_trace(go.Scatter(
+                x=sell_x,
+                y=sell_y,
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=14,
+                    color="#F44336",
+                    line=dict(width=1, color="white")
+                ),
+                hoverinfo="text",
+                hovertext=sell_text,
+                name="SELL",
+                showlegend=False
+            ))
+
+        # Add HOLD markers (orange diamond)
+        if hold_x:
+            fig.add_trace(go.Scatter(
+                x=hold_x,
+                y=hold_y,
+                mode="markers",
+                marker=dict(
+                    symbol="diamond",
+                    size=12,
+                    color="#FF9800",
+                    line=dict(width=1, color="white")
+                ),
+                hoverinfo="text",
+                hovertext=hold_text,
+                name="HOLD",
+                showlegend=False
+            ))
+
+        # Add OVERWEIGHT markers (light green triangle-up, smaller)
+        if overweight_x:
+            fig.add_trace(go.Scatter(
+                x=overweight_x,
+                y=overweight_y,
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=11,
+                    color="#8BC34A",
+                    line=dict(width=1, color="white")
+                ),
+                hoverinfo="text",
+                hovertext=overweight_text,
+                name="增持",
+                showlegend=False
+            ))
+
+        # Add UNDERWEIGHT markers (light red triangle-down, smaller)
+        if underweight_x:
+            fig.add_trace(go.Scatter(
+                x=underweight_x,
+                y=underweight_y,
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=11,
+                    color="#FF7043",
+                    line=dict(width=1, color="white")
+                ),
+                hoverinfo="text",
+                hovertext=underweight_text,
+                name="减持",
+                showlegend=False
+            ))
+
+        # Add trade trajectory lines
+        add_trade_trajectory(fig, analysis_data, df)
 
     fig.update_layout(
         title=title,
@@ -130,21 +378,42 @@ def render_candlestick_chart(df: pd.DataFrame, title: str = "", height: int = 30
 
 
 def format_signal(signal: str, confidence: float) -> str:
-    """Format AI signal with emoji and color."""
+    """Format AI signal with emoji and color - supports 5-tier rating."""
     if signal is None or confidence is None:
         return "⚪--(--%)"
-    emoji_map = {'BUY': '🟢', 'SELL': '🔴', 'HOLD': '🟡', 'UNKNOWN': '⚪'}
+    # 5-tier rating system
+    emoji_map = {
+        'BUY': '🟢',
+        'OVERWEIGHT': '📈',  # Light green/up trend
+        'HOLD': '🟡',
+        'UNDERWEIGHT': '📉',  # Light red/down trend
+        'SELL': '🔴',
+        'UNKNOWN': '⚪'
+    }
+    # Map to Chinese display
+    display_map = {
+        'BUY': '买入',
+        'OVERWEIGHT': '增持',
+        'HOLD': '持有',
+        'UNDERWEIGHT': '减持',
+        'SELL': '卖出',
+        'UNKNOWN': '未知'
+    }
     emoji = emoji_map.get(signal, '⚪')
-    return f"{emoji}{signal}({confidence:.0%})"
+    display = display_map.get(signal, signal)
+    return f"{emoji}{display}({confidence:.0%})"
 
 
 def get_signal_color(signal: str) -> str:
-    """Get color for signal."""
+    """Get color for signal - supports 5-tier rating."""
+    # 5-tier color scheme: strong green -> light green -> yellow -> light red -> strong red
     color_map = {
-        'BUY': '#4CAF50',
-        'SELL': '#F44336',
-        'HOLD': '#FF9800',
-        'UNKNOWN': '#9E9E9E'
+        'BUY': '#4CAF50',           # Strong green
+        'OVERWEIGHT': '#8BC34A',    # Light green
+        'HOLD': '#FF9800',          # Orange/Yellow
+        'UNDERWEIGHT': '#FF7043',   # Light red
+        'SELL': '#F44336',          # Strong red
+        'UNKNOWN': '#9E9E9E'        # Gray
     }
     return color_map.get(signal, '#9E9E9E')
 
@@ -267,10 +536,40 @@ def get_turning_alerts(limit: int = 20) -> List[Dict]:
     return []
 
 
+def fetch_analysis_history(watchlist_id: int, limit: int = 50) -> Optional[List[Dict]]:
+    """Fetch analysis history for a watchlist stock.
+
+    Args:
+        watchlist_id: The watchlist item ID
+        limit: Maximum number of records to fetch
+
+    Returns:
+        List of analysis history items, or None if fetch fails
+    """
+    try:
+        resp = requests.get(
+            f"{API_URL}/api/v1/watchlist/{watchlist_id}/analysis-history",
+            params={"limit": limit},
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", [])
+            # Cache in session state
+            cache_key = f"analysis_history_{watchlist_id}"
+            st.session_state[cache_key] = items
+            return items
+        else:
+            return None
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        return None
+
+
 def get_scheduler_status() -> Optional[Dict]:
     """Get scheduler status."""
     try:
-        resp = requests.get(f"{API_URL}/api/v1/scheduler/status", timeout=3)
+        resp = requests.get(f"{API_URL}/api/v1/watchlist/scheduler/status", timeout=3)
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -699,8 +998,11 @@ def render_control_buttons():
         # Show scheduler status
         scheduler_status = get_scheduler_status()
         if scheduler_status:
-            status_emoji = "🟢" if scheduler_status.get('status') == 'running' else "🔴"
-            st.caption(f"{status_emoji} 调度器: {scheduler_status.get('status', 'unknown')}")
+            is_running = scheduler_status.get('is_running', False)
+            status_emoji = "🟢" if is_running else "🔴"
+            status_text = "运行中" if is_running else "已停止"
+            active_jobs = scheduler_status.get('active_jobs', 0)
+            st.caption(f"{status_emoji} 调度器: {status_text} ({active_jobs} 个活跃任务)")
 
 
 def render_monitoring_panel():
@@ -738,10 +1040,19 @@ def render_monitoring_panel():
                 name = stock.get('name', symbol)
                 st.write(f"**{symbol} {name}**")
 
-                # Fetch and display chart
+                # Fetch and display chart with analysis overlay
                 df = get_stock_intraday_data(symbol)
                 if df is not None and not df.empty:
-                    render_candlestick_chart(df, height=350)
+                    # Fetch analysis history for this stock
+                    stock_id = stock.get('id')
+                    analysis_data = None
+                    if stock_id:
+                        analysis_data = fetch_analysis_history(stock_id)
+                        if analysis_data is None and f"analysis_history_{stock_id}" in st.session_state:
+                            # Use cached data if fetch failed
+                            analysis_data = st.session_state[f"analysis_history_{stock_id}"]
+
+                    render_candlestick_chart(df, analysis_data=analysis_data, height=350)
                 else:
                     st.caption("暂无数据")
 
@@ -796,12 +1107,31 @@ def render_monitoring_panel():
             else:
                 st.metric("最后分析", "--")
         
-        # Price trend - real K-line chart
+        # Price trend - real K-line chart with analysis overlay
         st.write("**价格走势**")
 
         detail_df = get_stock_intraday_data(symbol)
         if detail_df is not None and not detail_df.empty:
-            render_candlestick_chart(detail_df, title=f"{symbol} {name} 分时K线", height=400)
+            # Fetch analysis history for detailed view
+            watchlist_id = selected_item.get('id')
+            analysis_data = None
+            if watchlist_id:
+                analysis_data = fetch_analysis_history(watchlist_id)
+                if analysis_data is None:
+                    # Show warning but still display chart
+                    st.warning("⚠️ 分析历史数据获取失败，仅显示价格走势")
+                    # Try to use cached data
+                    cache_key = f"analysis_history_{watchlist_id}"
+                    if cache_key in st.session_state:
+                        analysis_data = st.session_state[cache_key]
+                        st.info("使用缓存的分析数据")
+
+            render_candlestick_chart(
+                detail_df,
+                title=f"{symbol} {name} 分时K线",
+                height=400,
+                analysis_data=analysis_data
+            )
         else:
             st.caption("暂无价格数据")
 

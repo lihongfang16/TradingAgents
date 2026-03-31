@@ -339,7 +339,10 @@ class AnalysisService:
     # ------------------------------------------------------------------
 
     async def run_analysis(
-        self, task_id: str, request: AnalysisRequest
+        self,
+        task_id: str,
+        request: AnalysisRequest,
+        on_complete: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> AnalysisResponse:
         """
         Run analysis for a task asynchronously using thread pool executor.
@@ -347,6 +350,7 @@ class AnalysisService:
         Args:
             task_id: UUID of the task to run
             request: AnalysisRequest containing analysis parameters
+            on_complete: Optional callback called when analysis finishes (receives task_id, result dict)
 
         Returns:
             AnalysisResponse with completed analysis result
@@ -378,12 +382,24 @@ class AnalysisService:
         # Re-read to get fresh state
         task_resp = self.get_task(task_id)
 
+        timeout_raw = os.getenv("ANALYSIS_TIMEOUT", "600")
+        try:
+            timeout_seconds = max(1, int(timeout_raw))
+        except (TypeError, ValueError):
+            timeout_seconds = 600
+            logger.warning(
+                "Invalid ANALYSIS_TIMEOUT value '%s', falling back to %s seconds",
+                timeout_raw,
+                timeout_seconds,
+            )
+
         result = None
         try:
             # Run the sync analysis in thread pool
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, self._run_sync_analysis, task_id, request
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, self._run_sync_analysis, task_id, request),
+                timeout=timeout_seconds,
             )
 
             # Update task with result in DB
@@ -406,16 +422,60 @@ class AnalysisService:
                         db_task.status = AnalysisStatus.COMPLETED.value
                         db_task.message = f"Analysis completed for {request.symbol}"
                         # Extract decision from result.signal
-                        if result and isinstance(result.get("signal"), dict):
-                            db_task.decision = result["signal"].get("decision")
+                        if result and result.get("signal"):
+                            signal = result["signal"]
+                            if isinstance(signal, dict):
+                                db_task.decision = signal.get("decision")
+                            elif isinstance(signal, str):
+                                # process_signal() returns raw LLM content; extract last word
+                                # The LLM is prompted to output "BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL"
+                                valid = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
+                                words = signal.strip().split()
+                                for w in reversed(words):
+                                    if w.upper() in valid:
+                                        db_task.decision = w.upper()
+                                        break
 
                     db.commit()
+
+                    # Call completion callback if provided
+                    if on_complete:
+                        try:
+                            on_complete(task_id, result)
+                        except Exception as cb_err:
+                            logger.warning("Completion callback error: %s", cb_err)
             except Exception:
                 db.rollback()
                 raise
             finally:
                 db.close()
 
+        except asyncio.TimeoutError:
+            timeout_error = f"Analysis timed out after {timeout_seconds}s"
+            now = datetime.utcnow()
+            db = SessionLocal()
+            try:
+                db_task = db.query(AnalysisTask).filter(
+                    AnalysisTask.task_id == task_id
+                ).first()
+                if db_task:
+                    db_task.status = AnalysisStatus.FAILED.value
+                    db_task.error = timeout_error
+                    db_task.completed_at = now
+                    db_task.updated_at = now
+                    db_task.message = f"Analysis failed: {timeout_error}"
+                    db.commit()
+
+                    # Call completion callback on timeout error
+                    if on_complete:
+                        try:
+                            on_complete(task_id, {"status": "error", "error": timeout_error})
+                        except Exception as cb_err:
+                            logger.warning("Completion callback error: %s", cb_err)
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
         except Exception as e:
             now = datetime.utcnow()
             db = SessionLocal()
@@ -430,6 +490,13 @@ class AnalysisService:
                     db_task.updated_at = now
                     db_task.message = f"Analysis failed: {str(e)}"
                     db.commit()
+
+                    # Call completion callback on error
+                    if on_complete:
+                        try:
+                            on_complete(task_id, {"status": "error", "error": str(e)})
+                        except Exception as cb_err:
+                            logger.warning("Completion callback error: %s", cb_err)
             except Exception:
                 db.rollback()
             finally:

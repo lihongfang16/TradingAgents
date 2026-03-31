@@ -134,36 +134,62 @@ def full_analysis_job():
     logger.info("[SCHEDULER] Starting full analysis job")
     try:
         from webapi.services.analysis_service import analysis_service
-        from webapi.models.database import SessionLocal, Watchlist
+        from webapi.config.database import SessionLocal
+        from webapi.models.database import Watchlist, WatchlistAnalysis
+        from webapi.models.analysis import AnalysisRequest, StockExchange
+        from webapi.routers.watchlist import create_analysis_complete_callback
 
         db = SessionLocal()
         try:
             # Get all active watchlist stocks
             watchlists = db.query(Watchlist).filter(
-                Watchlist.is_active == True
+                Watchlist.is_active == 'Y'
             ).all()
 
             if not watchlists:
                 logger.info("[SCHEDULER] No active watchlist stocks for full analysis")
                 return
 
-            symbols = [w.symbol for w in watchlists]
-            logger.info(f"[SCHEDULER] Full analysis for {len(symbols)} stocks: {symbols}")
+            logger.info(f"[SCHEDULER] Full analysis for {len(watchlists)} stocks: {[w.symbol for w in watchlists]}")
 
-            # Run batch analysis (async in background)
-            from webapi.models.analysis import BatchAnalysisRequest
-            request = BatchAnalysisRequest(symbols=symbols)
+            # Process each stock individually with callback
+            async def run_all_analyses():
+                """Run all analyses concurrently."""
+                tasks = []
+                for watchlist in watchlists:
+                    # Create analysis request
+                    request = AnalysisRequest(
+                        symbol=watchlist.symbol,
+                        exchange=StockExchange.CN,
+                    )
+                    task = analysis_service.create_task(request)
 
-            # Create event loop for async call
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                batch_response = loop.run_until_complete(
-                    analysis_service.run_batch(request)
-                )
-                logger.info(f"[SCHEDULER] Full analysis batch started: {batch_response.batch_id}")
-            finally:
-                loop.close()
+                    # Create watchlist analysis record
+                    watchlist_analysis = WatchlistAnalysis(
+                        watchlist_id=watchlist.id,
+                        analysis_id=task.task_id,
+                        analysis_type='full',
+                        triggered_by='scheduled',
+                        created_at=datetime.utcnow(),
+                    )
+                    db.add(watchlist_analysis)
+                    db.commit()
+                    db.refresh(watchlist_analysis)
+
+                    # Create analysis task with callback
+                    tasks.append(
+                        analysis_service.run_analysis(
+                            task.task_id,
+                            request,
+                            on_complete=create_analysis_complete_callback(watchlist_analysis.id)
+                        )
+                    )
+                logger.info(f"[SCHEDULER] Full analysis started for {len(watchlists)} stocks")
+                # Run all analyses concurrently
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Run the async function in a new event loop
+            asyncio.run(run_all_analyses())
 
         finally:
             db.close()
@@ -179,36 +205,64 @@ def quick_analysis_job():
     logger.info("[SCHEDULER] Starting quick analysis job")
     try:
         from webapi.services.analysis_service import analysis_service
-        from webapi.models.database import SessionLocal, Watchlist
+        from webapi.config.database import SessionLocal
+        from webapi.models.database import Watchlist, WatchlistAnalysis
+        from webapi.models.analysis import AnalysisRequest, StockExchange
+        from webapi.routers.watchlist import create_analysis_complete_callback
 
         db = SessionLocal()
         try:
             # Get all active watchlist stocks (not in high-frequency mode for regular quick analysis)
             watchlists = db.query(Watchlist).filter(
-                Watchlist.is_active == True,
-                Watchlist.is_high_frequency == False
+                Watchlist.is_active == 'Y',
+                Watchlist.is_high_frequency == 'N'
             ).all()
 
             if not watchlists:
                 logger.info("[SCHEDULER] No stocks for quick analysis (all may be in high-frequency mode)")
                 return
 
-            symbols = [w.symbol for w in watchlists]
-            logger.info(f"[SCHEDULER] Quick analysis for {len(symbols)} stocks: {symbols}")
+            logger.info(f"[SCHEDULER] Quick analysis for {len(watchlists)} stocks: {[w.symbol for w in watchlists]}")
 
-            # Run batch analysis
-            from webapi.models.analysis import BatchAnalysisRequest
-            request = BatchAnalysisRequest(symbols=symbols)
+            # Process each stock individually with callback
+            async def run_all_quick_analyses():
+                """Run all quick analyses concurrently."""
+                tasks = []
+                for watchlist in watchlists:
+                    # Create quick analysis request (market analyst only)
+                    request = AnalysisRequest(
+                        symbol=watchlist.symbol,
+                        exchange=StockExchange.CN,
+                        analysts=["market"],
+                    )
+                    task = analysis_service.create_task(request)
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                batch_response = loop.run_until_complete(
-                    analysis_service.run_batch(request)
-                )
-                logger.info(f"[SCHEDULER] Quick analysis batch started: {batch_response.batch_id}")
-            finally:
-                loop.close()
+                    # Create watchlist analysis record
+                    watchlist_analysis = WatchlistAnalysis(
+                        watchlist_id=watchlist.id,
+                        analysis_id=task.task_id,
+                        analysis_type='quick',
+                        triggered_by='scheduled',
+                        created_at=datetime.utcnow(),
+                    )
+                    db.add(watchlist_analysis)
+                    db.commit()
+                    db.refresh(watchlist_analysis)
+
+                    # Create analysis task with callback
+                    tasks.append(
+                        analysis_service.run_analysis(
+                            task.task_id,
+                            request,
+                            on_complete=create_analysis_complete_callback(watchlist_analysis.id)
+                        )
+                    )
+                logger.info(f"[SCHEDULER] Quick analysis started for {len(watchlists)} stocks")
+                # Run all analyses concurrently
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Run the async function
+            asyncio.run(run_all_quick_analyses())
 
         finally:
             db.close()
@@ -225,15 +279,18 @@ def high_frequency_batch_job():
     logger.info("[SCHEDULER] Starting high-frequency batch job")
     try:
         from webapi.services.analysis_service import analysis_service
-        from webapi.models.database import SessionLocal, Watchlist
+        from webapi.config.database import SessionLocal
+        from webapi.models.database import Watchlist, WatchlistAnalysis
+        from webapi.models.analysis import AnalysisRequest, StockExchange
+        from webapi.routers.watchlist import create_analysis_complete_callback
 
         db = SessionLocal()
         try:
             # Get all stocks in high-frequency mode that haven't expired
             now = datetime.utcnow()
             watchlists = db.query(Watchlist).filter(
-                Watchlist.is_active == True,
-                Watchlist.is_high_frequency == True,
+                Watchlist.is_active == 'Y',
+                Watchlist.is_high_frequency == 'Y',
                 Watchlist.high_freq_until > now
             ).all()
 
@@ -241,26 +298,50 @@ def high_frequency_batch_job():
                 logger.info("[SCHEDULER] No stocks in high-frequency mode")
                 return
 
-            symbols = [w.symbol for w in watchlists]
-            logger.info(f"[SCHEDULER] High-frequency analysis for {len(symbols)} stocks: {symbols}")
+            logger.info(f"[SCHEDULER] High-frequency analysis for {len(watchlists)} stocks: {[w.symbol for w in watchlists]}")
 
-            # Run batch analysis
-            from webapi.models.analysis import BatchAnalysisRequest
-            request = BatchAnalysisRequest(symbols=symbols)
+            # Process each stock individually with callback
+            async def run_all_high_freq_analyses():
+                """Run all high-frequency analyses concurrently."""
+                tasks = []
+                for watchlist in watchlists:
+                    # Create quick analysis request (market analyst only)
+                    request = AnalysisRequest(
+                        symbol=watchlist.symbol,
+                        exchange=StockExchange.CN,
+                        analysts=["market"],
+                    )
+                    task = analysis_service.create_task(request)
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                batch_response = loop.run_until_complete(
-                    analysis_service.run_batch(request)
-                )
-                logger.info(f"[SCHEDULER] High-frequency batch started: {batch_response.batch_id}")
+                    # Create watchlist analysis record
+                    watchlist_analysis = WatchlistAnalysis(
+                        watchlist_id=watchlist.id,
+                        analysis_id=task.task_id,
+                        analysis_type='quick',
+                        triggered_by='scheduled',
+                        created_at=datetime.utcnow(),
+                    )
+                    db.add(watchlist_analysis)
+                    db.commit()
+                    db.refresh(watchlist_analysis)
 
-                # After analysis, check if we should deactivate high-frequency mode
-                _check_and_deactivate_high_frequency(db, watchlists)
+                    # Create analysis task with callback
+                    tasks.append(
+                        analysis_service.run_analysis(
+                            task.task_id,
+                            request,
+                            on_complete=create_analysis_complete_callback(watchlist_analysis.id)
+                        )
+                    )
+                logger.info(f"[SCHEDULER] High-frequency analysis started for {len(watchlists)} stocks")
+                # Run all analyses concurrently
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            finally:
-                loop.close()
+            # Run the async function
+            asyncio.run(run_all_high_freq_analyses())
+
+            # After analysis, check if we should deactivate high-frequency mode
+            _check_and_deactivate_high_frequency(db, watchlists)
 
         finally:
             db.close()
@@ -296,7 +377,7 @@ def _check_and_deactivate_high_frequency(db, watchlists):
             if len(recent_results) >= 3:
                 # Check if should return to normal frequency
                 if not should_use_high_frequency(recent_results, stable_threshold=3):
-                    watchlist.is_high_frequency = False
+                    watchlist.is_high_frequency = 'N'
                     watchlist.high_freq_until = None
                     logger.info(f"[SCHEDULER] Deactivated high-frequency mode for {watchlist.symbol} - signals stable")
                     break  # Process one at a time
@@ -317,7 +398,8 @@ def on_analysis_complete(watchlist_id: int, result: Dict[str, Any]):
         result: Analysis result dict with signal, confidence, risk_level
     """
     try:
-        from webapi.models.database import SessionLocal, Watchlist, WatchlistAnalysis
+        from webapi.config.database import SessionLocal
+        from webapi.models.database import Watchlist, WatchlistAnalysis
 
         db = SessionLocal()
         try:
@@ -367,6 +449,8 @@ def on_analysis_complete(watchlist_id: int, result: Dict[str, Any]):
                 signal=current_result['signal'],
                 confidence=current_result['confidence'],
                 risk_level=current_result['risk_level'],
+                price=result.get('price') or watchlist.last_price,
+                error_message=result.get('error') if result.get('status') == 'error' else None,
                 is_turning_point=is_turning,
                 turning_reason=reason if is_turning else None,
                 importance_score=importance if is_turning else 0,

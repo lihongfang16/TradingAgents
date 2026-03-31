@@ -16,7 +16,7 @@ HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 DELETED_IDS_FILE = os.path.join(HISTORY_DIR, "deleted_ids.json")
 
 # API URL - use same default as app.py
-API_URL = os.environ.get("API_URL", "http://localhost:8005")
+API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
 
 def ensure_history_dir():

@@ -14,7 +14,10 @@ from webapi.models.analysis import (
     BatchAnalysisResponse,
     AnalysisStatus,
 )
-from webapi.services.analysis_service import analysis_service
+# Lazy import to avoid slow startup
+def get_analysis_service():
+    from webapi.services.analysis_service import analysis_service
+    return analysis_service
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
@@ -26,11 +29,11 @@ router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 @router.post("/", response_model=AnalysisResponse)
 async def create_analysis(request: AnalysisRequest):
     """Create a new analysis task and start execution in background"""
-    task = analysis_service.create_task(request)
+    task = get_analysis_service().create_task(request)
     
     # Start analysis in background immediately
     asyncio.create_task(
-        analysis_service.run_analysis(task.task_id, request)
+        get_analysis_service().run_analysis(task.task_id, request)
     )
     
     return task
@@ -39,7 +42,7 @@ async def create_analysis(request: AnalysisRequest):
 @router.get("/{task_id}", response_model=AnalysisResponse)
 async def get_analysis(task_id: str):
     """Get analysis status by task ID"""
-    result = analysis_service.get_task(task_id)
+    result = get_analysis_service().get_task(task_id)
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
     return result
@@ -48,7 +51,7 @@ async def get_analysis(task_id: str):
 @router.delete("/{task_id}", status_code=204)
 async def delete_analysis(task_id: str):
     """Delete an analysis task by ID"""
-    deleted = analysis_service.delete_task(task_id)
+    deleted = get_analysis_service().delete_task(task_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Task not found")
     return None
@@ -60,21 +63,21 @@ async def list_analyses(
     limit: int = Query(10, ge=1, le=100, description="Maximum number of results"),
 ):
     """List all analyses with optional symbol filter"""
-    return analysis_service.list_tasks(symbol=symbol, limit=limit)
+    return get_analysis_service().list_tasks(symbol=symbol, limit=limit)
 
 
 @router.post("/batch", response_model=BatchAnalysisResponse)
 async def batch_analysis(request: BatchAnalysisRequest):
     """Create and run batch analysis for multiple symbols"""
     # Use run_batch which creates tasks AND starts execution
-    return await analysis_service.run_batch(request)
+    return await get_analysis_service().run_batch(request)
 
 
 @router.get("/{task_id}/progress")
 async def get_progress(task_id: str):
     """SSE stream for real-time progress updates with agent-level tracking"""
     async def event_generator() -> AsyncGenerator[dict, None]:
-        task = analysis_service.get_task(task_id)
+        task = get_analysis_service().get_task(task_id)
         if not task:
             yield {"event": "error", "data": json.dumps({"error": "Task not found"})}
             return
@@ -97,10 +100,10 @@ async def get_progress(task_id: str):
                 "data": json.dumps(progress_data),
             }
             await asyncio.sleep(2)
-            task = analysis_service.get_task(task_id)
+            task = get_analysis_service().get_task(task_id)
 
         # Final status - include full result
-        final_task = analysis_service.get_task(task_id)
+        final_task = get_analysis_service().get_task(task_id)
         if final_task is None:
             # Task was deleted mid-stream
             yield {

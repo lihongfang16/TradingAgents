@@ -214,7 +214,7 @@ class Watchlist(Base):
     
     # Current state from last analysis
     last_analysis_at = Column(DateTime, nullable=True)
-    last_signal = Column(String(10), nullable=True)  # BUY, SELL, HOLD
+    last_signal = Column(String(20), nullable=True)  # BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL
     last_confidence = Column(String(10), nullable=True)
     last_risk_level = Column(String(20), nullable=True)
     
@@ -295,9 +295,11 @@ class WatchlistAnalysis(Base):
     completed_at = Column(DateTime, nullable=True)
     
     # Analysis result
-    signal = Column(String(10), nullable=True)  # BUY, SELL, HOLD
+    signal = Column(String(20), nullable=True)  # BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL
     confidence = Column(String(10), nullable=True)
     risk_level = Column(String(20), nullable=True)
+    price = Column(String(20), nullable=True)  # Stock price at analysis time
+    error_message = Column(Text, nullable=True)  # Error details if analysis failed
     
     # Turning detection
     is_turning_point = Column(String(1), nullable=False, default='N')  # Y/N
@@ -327,6 +329,8 @@ class WatchlistAnalysis(Base):
             'signal': self.signal,
             'confidence': float(self.confidence) if self.confidence else None,
             'risk_level': self.risk_level,
+            'price': float(self.price) if self.price else None,
+            'error_message': self.error_message,
             'is_turning_point': self.is_turning_point == 'Y',
             'turning_reason': self.turning_reason,
             'importance_score': float(self.importance_score) if self.importance_score else None,
@@ -348,6 +352,8 @@ class WatchlistAnalysis(Base):
             signal=data.get('signal'),
             confidence=str(data['confidence']) if data.get('confidence') is not None else None,
             risk_level=data.get('risk_level'),
+            price=str(data['price']) if data.get('price') is not None else None,
+            error_message=data.get('error_message'),
             is_turning_point='Y' if data.get('is_turning_point', False) else 'N',
             turning_reason=data.get('turning_reason'),
             importance_score=str(data['importance_score']) if data.get('importance_score') is not None else None,

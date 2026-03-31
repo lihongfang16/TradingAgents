@@ -1,6 +1,7 @@
 """
 Watchlist Router for TradingAgents API
 """
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -9,7 +10,13 @@ from sqlalchemy.orm import Session
 
 from webapi.config.database import get_db
 from webapi.models.database import Watchlist, WatchlistAnalysis, WatchlistConfig
-from webapi.models.analysis import AnalysisRequest, StockExchange
+from webapi.models.analysis import (
+    AnalysisRequest,
+    StockExchange,
+    AnalysisHistoryResponse,
+    AnalysisHistoryItem,
+    SignalType,
+)
 import asyncio
 
 # Lazy import analysis_service to avoid slow startup
@@ -21,6 +28,100 @@ def get_analysis_service():
 def get_scheduler_service():
     from webapi.services.scheduler_service import scheduler_service
     return scheduler_service
+
+
+def create_analysis_complete_callback(watchlist_analysis_id: int):
+    """Create callback to update WatchlistAnalysis and Watchlist when analysis completes."""
+    def callback(task_id: str, result: Dict[str, Any]):
+        from webapi.config.database import SessionLocal
+        db = SessionLocal()
+        try:
+            analysis = db.query(WatchlistAnalysis).filter(
+                WatchlistAnalysis.id == watchlist_analysis_id
+            ).first()
+            if analysis:
+                analysis.completed_at = datetime.utcnow()
+                
+                # Extract signal and confidence for later use
+                signal_value = "UNKNOWN"
+                confidence_value = 0.0
+                
+                if result.get("status") == "error":
+                    analysis.error_message = result.get("error", "Analysis failed")
+                else:
+                    # Extract signal
+                    signal = result.get("signal", "")
+                    if isinstance(signal, dict):
+                        signal_value = signal.get("decision", "UNKNOWN")
+                        confidence_value = signal.get("confidence", 0) or 0.0
+                        analysis.signal = signal_value
+                        analysis.confidence = confidence_value
+                    elif isinstance(signal, str):
+                        # Normalize signal: uppercase, strip whitespace, extract last word
+                        normalized = signal.upper().strip()
+                        # Extract the last word if it contains spaces (e.g., "Decision: BUY" -> "BUY")
+                        words = normalized.split()
+                        if words:
+                            last_word = words[-1]
+                            # Map common variations to standard 5-tier signals
+                            signal_map = {
+                                'BUY': 'BUY',
+                                'OVERWEIGHT': 'OVERWEIGHT',
+                                'HOLD': 'HOLD',
+                                'UNDERWEIGHT': 'UNDERWEIGHT',
+                                'SELL': 'SELL',
+                                # Handle common misspellings/variations with trailing dots
+                                'BUY.': 'BUY',
+                                'OVERWEIGHT.': 'OVERWEIGHT',
+                                'HOLD.': 'HOLD',
+                                'UNDERWEIGHT.': 'UNDERWEIGHT',
+                                'SELL.': 'SELL',
+                                # Chinese translations
+                                '买入': 'BUY',
+                                '增持': 'OVERWEIGHT',
+                                '持有': 'HOLD',
+                                '减持': 'UNDERWEIGHT',
+                                '卖出': 'SELL',
+                            }
+                            signal_value = signal_map.get(last_word, last_word)
+                        else:
+                            signal_value = "UNKNOWN"
+                        analysis.signal = signal_value
+                        # Confidence not available from signal processor - store None
+                        # Don't fabricate confidence as it misleads users
+                        analysis.confidence = None
+                    
+                    # Set price from result or fallback to watchlist last_price
+                    analysis.price = result.get("price")
+                    if not analysis.price:
+                        watchlist = db.query(Watchlist).filter(
+                            Watchlist.id == analysis.watchlist_id
+                        ).first()
+                        if watchlist and watchlist.last_price:
+                            analysis.price = float(watchlist.last_price)
+                    
+                    # Update confidence_value for watchlist update (None if not available)
+                    confidence_value = analysis.confidence
+                
+                db.commit()
+                
+                # Also update Watchlist current state for UI display
+                watchlist = db.query(Watchlist).filter(
+                    Watchlist.id == analysis.watchlist_id
+                ).first()
+                if watchlist:
+                    watchlist.last_analysis_at = datetime.utcnow()
+                    watchlist.last_signal = signal_value
+                    watchlist.last_confidence = str(confidence_value)
+                    db.commit()
+                    
+        except Exception as e:
+            db.rollback()
+            print(f"[CALLBACK ERROR] {e}", file=sys.stderr)
+        finally:
+            db.close()
+    return callback
+
 
 router = APIRouter(prefix="/api/v1/watchlist", tags=["watchlist"])
 
@@ -591,9 +692,14 @@ async def trigger_watchlist_analysis(
         db.add(watchlist_analysis)
         db.commit()
 
-        # Start analysis in background
+        # Start analysis in background with callback
+        watchlist_analysis_id = watchlist_analysis.id
         asyncio.create_task(
-            get_analysis_service().run_analysis(task.task_id, request)
+            get_analysis_service().run_analysis(
+                task.task_id, 
+                request,
+                on_complete=create_analysis_complete_callback(watchlist_analysis_id)
+            )
         )
 
         results.append({
@@ -635,9 +741,71 @@ async def quick_analyze(
     db.commit()
     db.refresh(watchlist_analysis)
 
-    # Start analysis in background
+    # Start analysis in background with callback
+    watchlist_analysis_id = watchlist_analysis.id
     asyncio.create_task(
-        get_analysis_service().run_analysis(task.task_id, request)
+        get_analysis_service().run_analysis(
+            task.task_id, 
+            request,
+            on_complete=create_analysis_complete_callback(watchlist_analysis_id)
+        )
     )
 
     return _analysis_to_response(watchlist_analysis)
+
+
+# ============================================================================
+# Analysis History Endpoint (for K-line Signal Overlay)
+# ============================================================================
+
+
+@router.get("/{watchlist_id}/analysis-history", response_model=AnalysisHistoryResponse)
+async def get_analysis_history(
+    watchlist_id: int,
+    limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    db: Session = Depends(get_db),
+):
+    """Get analysis history for a watchlist stock (for K-line overlay)."""
+    # Check if watchlist exists
+    watchlist = db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
+    if not watchlist:
+        raise HTTPException(status_code=404, detail="Watchlist entry not found")
+
+    # Query analysis history - filter to only include records with valid signals
+    # This ensures total/has_more are accurate for the actual returned items
+    valid_signals = [s.value for s in SignalType]
+    query = db.query(WatchlistAnalysis).filter(
+        WatchlistAnalysis.watchlist_id == watchlist_id,
+        WatchlistAnalysis.completed_at.isnot(None),  # Only completed analyses
+        WatchlistAnalysis.signal.in_(valid_signals)  # Only valid signals
+    ).order_by(WatchlistAnalysis.created_at.desc())
+
+    total = query.count()
+    analyses = query.offset(offset).limit(limit).all()
+
+    # Convert to response items
+    items = []
+    for analysis in analyses:
+        # Signal is already validated by the query filter
+        signal_enum = SignalType(analysis.signal)
+        
+        # Use completed_at for timestamp (when price was captured)
+        # Only include confidence if it was actually produced by the analysis
+        confidence_val = float(analysis.confidence) if analysis.confidence else None
+        
+        items.append(AnalysisHistoryItem(
+            timestamp=analysis.completed_at or analysis.created_at,
+            signal=signal_enum,
+            confidence=confidence_val,
+            price=float(analysis.price) if analysis.price else None,
+            error_message=analysis.error_message,
+        ))
+
+    return AnalysisHistoryResponse(
+        watchlist_id=watchlist_id,
+        symbol=watchlist.symbol,
+        items=items,
+        total=total,
+        has_more=(offset + len(items)) < total,
+    )
