@@ -55,22 +55,6 @@ def _china_get_indicators(symbol: str, indicator: str, curr_date: str, look_back
     if df is None or df.empty:
         return f"No data available for {symbol}"
 
-
-def _china_get_news(ticker: str, start_date: str, end_date: str) -> str:
-    """Adapter: get_news(ticker, start_date, end_date) -> china_manager.get_realtime_quote()."""
-    data = china_manager.get_realtime_quote(ticker)
-    if data is None:
-        return f"No realtime quote data available for {ticker}"
-    return str(data)
-
-
-def _china_get_fundamentals(ticker: str, curr_date: str) -> str:
-    """Adapter: get_fundamentals(ticker, curr_date) -> china_manager.get_fundamental_data()."""
-    data = china_manager.get_fundamental_data(ticker)
-    if data is None:
-        return f"No fundamental data available for {ticker}"
-    return str(data)
-
     # stockstats requires integer index, not DatetimeIndex
     df_work = df.reset_index(drop=True)
     for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -163,6 +147,22 @@ def _china_get_fundamentals(ticker: str, curr_date: str) -> str:
         return result.to_string()
     except Exception as e:
         return f"Error computing indicator '{indicator}': {e}"
+
+
+def _china_get_news(ticker: str, start_date: str, end_date: str) -> str:
+    """Adapter: get_news(ticker, start_date, end_date) -> china_manager.get_realtime_quote()."""
+    data = china_manager.get_realtime_quote(ticker)
+    if data is None:
+        return f"No realtime quote data available for {ticker}"
+    return str(data)
+
+
+def _china_get_fundamentals(ticker: str, curr_date: str) -> str:
+    """Adapter: get_fundamentals(ticker, curr_date) -> china_manager.get_fundamental_data()."""
+    data = china_manager.get_fundamental_data(ticker)
+    if data is None:
+        return f"No fundamental data available for {ticker}"
+    return str(data)
 
 
 def is_a_share(symbol: str) -> bool:

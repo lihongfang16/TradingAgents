@@ -1,0 +1,41 @@
+============================================================
+TradingAgents E2E Functional Test
+Timestamp: 2026-03-26 16:33:59
+API Base: http://localhost:8005
+============================================================
+
+============================================================
+TEST 0: Health Check
+============================================================
+  GET /health -> status=200, body={'status': 'healthy'}
+  PASS: API is healthy
+
+============================================================
+TEST 1: Create Analysis Task (POST /api/v1/analysis/)
+============================================================
+  Request: POST /api/v1/analysis/ with payload={'symbol': '000001', 'analysts': ['market']}
+  Response status: 200
+  Response body: {
+  "task_id": "ffdef72d-38b2-4e5e-b233-36f5b9d29d95",
+  "status": "PENDING",
+  "symbol": "000001",
+  "message": "Task created for 000001",
+  "created_at": "2026-03-26T08:33:59.206168",
+  "updated_at": null,
+  "completed_at": null,
+  "result": null,
+  "error": null,
+  "logs": []
+}
+  Created task_id: ffdef72d-38b2-4e5e-b233-36f5b9d29d95
+  PASS: Task created successfully
+
+============================================================
+TEST 2: Verify Database Record (psql)
+============================================================
+  Total records in analysis_tasks: 2
+  DB record: ffdef72d-38b2-4e5e-b233-36f5b9d29d95|000001|RUNNING
+
+============================================================
+TEST FAILED: PENDING status not found in record
+============================================================

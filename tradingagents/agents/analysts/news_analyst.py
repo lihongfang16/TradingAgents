@@ -103,6 +103,13 @@ _ASHARE_SYSTEM_MESSAGE = (
 
 def create_news_analyst(llm):
     def news_analyst_node(state):
+        # Skip if news report already exists (from cache)
+        if state.get("news_report"):
+            return {
+                "messages": [],
+                "news_report": state["news_report"],
+            }
+
         current_date = state["trade_date"]
         symbol = state["company_of_interest"]
         instrument_context = build_instrument_context(symbol)

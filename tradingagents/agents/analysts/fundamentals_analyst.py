@@ -15,6 +15,13 @@ from tradingagents.dataflows.config import get_config
 
 def create_fundamentals_analyst(llm):
     def fundamentals_analyst_node(state):
+        # Skip if fundamentals report already exists (from cache)
+        if state.get("fundamentals_report"):
+            return {
+                "messages": [],
+                "fundamentals_report": state["fundamentals_report"],
+            }
+
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 

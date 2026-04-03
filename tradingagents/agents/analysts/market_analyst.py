@@ -142,6 +142,13 @@ Volume-Based Indicators:
 def create_market_analyst(llm):
 
     def market_analyst_node(state):
+        # Skip if market report already exists (from cache)
+        if state.get("market_report"):
+            return {
+                "messages": [],
+                "market_report": state["market_report"],
+            }
+
         current_date = state["trade_date"]
         instrument_context = build_instrument_context(state["company_of_interest"])
 

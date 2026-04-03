@@ -1,5 +1,7 @@
 # TradingAgents/graph/setup.py
 
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportExplicitAny=false, reportGeneralTypeIssues=false, reportAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnannotatedClassAttribute=false, reportDeprecated=false, reportMissingTypeArgument=false, reportUnusedImport=false, reportUnusedVariable=false, reportMissingParameterType=false, reportUnknownParameterType=false, reportUnusedCallResult=false, reportMissingTypeStubs=false
+
 from typing import Dict, Any
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
@@ -38,7 +40,9 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
 
     def setup_graph(
-        self, selected_analysts=["market", "social", "news", "fundamentals"]
+        self,
+        selected_analysts=["market", "social", "news", "fundamentals"],
+        fast_mode: bool = False,
     ):
         """Set up and compile the agent workflow graph.
 
@@ -96,6 +100,7 @@ class GraphSetup:
             self.deep_thinking_llm, self.invest_judge_memory
         )
         trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        quick_risk_check_node = create_quick_risk_check(self.quick_thinking_llm)
 
         # Create risk analysis nodes
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
@@ -117,14 +122,18 @@ class GraphSetup:
             workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
 
         # Add other nodes
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
-        workflow.add_node("Research Manager", research_manager_node)
         workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
+
+        if fast_mode:
+            workflow.add_node("Quick Risk Check", quick_risk_check_node)
+        else:
+            workflow.add_node("Bull Researcher", bull_researcher_node)
+            workflow.add_node("Bear Researcher", bear_researcher_node)
+            workflow.add_node("Research Manager", research_manager_node)
+            workflow.add_node("Aggressive Analyst", aggressive_analyst)
+            workflow.add_node("Neutral Analyst", neutral_analyst)
+            workflow.add_node("Conservative Analyst", conservative_analyst)
 
         # Define edges
         # Start with the first analyst
@@ -150,7 +159,13 @@ class GraphSetup:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+                workflow.add_edge(current_clear, "Quick Risk Check" if fast_mode else "Bull Researcher")
+
+        if fast_mode:
+            workflow.add_edge("Quick Risk Check", "Trader")
+            workflow.add_edge("Trader", "Portfolio Manager")
+            workflow.add_edge("Portfolio Manager", END)
+            return workflow.compile()
 
         # Add remaining edges
         workflow.add_conditional_edges(

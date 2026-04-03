@@ -1,4 +1,6 @@
 """Watchlist Manager Component for TradingAgents Web UI."""
+
+# pyright: reportMissingTypeStubs=false, reportReturnType=false, reportCallIssue=false, reportArgumentType=false, reportMissingTypeArgument=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportAttributeAccessIssue=false
 import json
 import os
 import sys
@@ -6,8 +8,9 @@ import traceback
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+from socket import timeout as SocketTimeout
 
 import streamlit as st
 
@@ -64,6 +67,10 @@ def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
 def add_trade_trajectory(fig, analysis_data: List[Dict], df: pd.DataFrame) -> None:
     """Add trading trajectory lines between BUY and SELL signals.
 
+    Detects both BUY→SELL (long) and SELL→BUY (short) trade pairs.
+    Profitable trades are drawn as green solid lines; losing trades as
+    red dashed lines.  Hovering over a line shows entry/exit price and P&L.
+
     Args:
         fig: Plotly figure object to add traces to
         analysis_data: List of analysis history items with signal data
@@ -74,74 +81,104 @@ def add_trade_trajectory(fig, analysis_data: List[Dict], df: pd.DataFrame) -> No
     if not analysis_data or df.empty:
         return
 
-    # Sort analysis data by timestamp
+    # Sort analysis data chronologically
     sorted_data = sorted(analysis_data, key=lambda x: x.get("timestamp", ""))
 
-    # Find BUY-SELL pairs
-    buy_signals = []
+    def _find_idx(timestamp_str: str) -> Optional[int]:
+        """Find DataFrame index position closest to *timestamp_str* within 5 min."""
+        try:
+            ts = pd.to_datetime(timestamp_str)
+            best_idx, best_diff = None, float("inf")
+            for i, idx in enumerate(df.index):
+                diff = abs((idx - ts).total_seconds())
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = i
+            return best_idx if best_idx is not None and best_diff <= 300 else None
+        except Exception:
+            return None
+
+    # --- pair detection ---------------------------------------------------
+    # Stack-based: BUY opens a long, SELL opens a short.
+    # A BUY while short → close short (SELL→BUY pair).
+    # A SELL while long → close long (BUY→SELL pair).
+    open_positions: list = []  # list of (signal_type, item_dict, df_idx)
+    pairs: list = []           # list of (entry_item, exit_item, entry_idx, exit_idx)
+
     for item in sorted_data:
         signal = item.get("signal", "")
+        if signal not in ("BUY", "SELL"):
+            continue
+
+        idx = _find_idx(item.get("timestamp", ""))
+        if idx is None:
+            continue
+
         if signal == "BUY":
-            buy_signals.append(item)
-        elif signal == "SELL" and buy_signals:
-            # Match with most recent unmatched BUY (LIFO)
-            buy_item = buy_signals.pop()
+            if open_positions and open_positions[-1][0] == "SELL":
+                # Close short: SELL→BUY pair
+                sell_item, _, sell_idx = open_positions.pop()
+                pairs.append((sell_item, item, sell_idx, idx))
+            else:
+                # Open long
+                open_positions.append(("BUY", item, idx))
+        else:  # SELL
+            if open_positions and open_positions[-1][0] == "BUY":
+                # Close long: BUY→SELL pair
+                buy_item, _, buy_idx = open_positions.pop()
+                pairs.append((buy_item, item, buy_idx, idx))
+            else:
+                # Open short
+                open_positions.append(("SELL", item, idx))
 
-            # Parse timestamps
-            try:
-                buy_ts = pd.to_datetime(buy_item.get("timestamp"))
-                sell_ts = pd.to_datetime(item.get("timestamp"))
+    # --- draw trajectory lines --------------------------------------------
+    for entry_item, exit_item, entry_idx, exit_idx in pairs:
+        if entry_idx >= exit_idx:
+            continue  # skip malformed pairs
 
-                # Find matching indices in df (use 5 min tolerance like markers)
-                buy_idx = None
-                sell_idx = None
-                for i, idx in enumerate(df.index):
-                    if abs((idx - buy_ts).total_seconds()) < 300:  # Within 5 minutes
-                        buy_idx = i
-                    if abs((idx - sell_ts).total_seconds()) < 300:
-                        sell_idx = i
+        # Use price from analysis data, or fallback to candle close price
+        entry_price = entry_item.get("price")
+        if entry_price is None:
+            entry_price = df.iloc[entry_idx]["close"]
+        exit_price = exit_item.get("price")
+        if exit_price is None:
+            exit_price = df.iloc[exit_idx]["close"]
 
-                if buy_idx is not None and sell_idx is not None and buy_idx < sell_idx:
-                    # Use price from analysis data, or fallback to candle close price
-                    buy_price = buy_item.get("price")
-                    if buy_price is None:
-                        buy_price = df.iloc[buy_idx]["close"]
-                    sell_price = item.get("price")
-                    if sell_price is None:
-                        sell_price = df.iloc[sell_idx]["close"]
+        # Determine direction and P&L
+        entry_signal = entry_item.get("signal", "BUY")
+        if entry_signal == "BUY":
+            pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        else:  # SELL (short)
+            pnl_pct = ((entry_price - exit_price) / entry_price * 100) if entry_price > 0 else 0
 
-                    # Calculate profit/loss
-                    pnl_pct = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+        is_profit = pnl_pct > 0
+        line_color = "#4CAF50" if is_profit else "#F44336"
+        line_dash = "solid" if is_profit else "dash"
+        direction = "BUY→SELL" if entry_signal == "BUY" else "SELL→BUY"
 
-                    # Determine line style based on profit
-                    is_profit = sell_price > buy_price
-                    line_color = "#4CAF50" if is_profit else "#F44336"
-                    line_dash = "solid" if is_profit else "dash"
-
-                    # Add trajectory line
-                    fig.add_trace(go.Scatter(
-                        x=[buy_idx, sell_idx],
-                        y=[buy_price, sell_price],
-                        mode="lines",
-                        line=dict(
-                            color=line_color,
-                            width=2,
-                            dash=line_dash
-                        ),
-                        hoverinfo="text",
-                        hovertext=f"Trade: BUY→SELL<br>Entry: ¥{buy_price:.2f}<br>Exit: ¥{sell_price:.2f}<br>P/L: {pnl_pct:+.2f}%",
-                        showlegend=False
-                    ))
-            except Exception:
-                pass  # Skip this pair if parsing fails
+        fig.add_trace(go.Scatter(
+            x=[entry_idx, exit_idx],
+            y=[entry_price, exit_price],
+            mode="lines",
+            line=dict(color=line_color, width=2, dash=line_dash),
+            hovertemplate=(
+                f"Trade: {direction}<br>"
+                "Entry: ¥%{customdata[0]:.2f}<br>"
+                "Exit: ¥%{customdata[1]:.2f}<br>"
+                "P&amp;L: %{customdata[2]:+.2f}%<extra></extra>"
+            ),
+            customdata=[[entry_price, exit_price, pnl_pct]],
+            showlegend=False,
+        ))
 
 
 def render_candlestick_chart(
     df: pd.DataFrame,
     title: str = "",
     height: int = 300,
-    analysis_data: Optional[List[Dict]] = None
-):
+    analysis_data: Optional[List[Dict]] = None,
+    chart_key: str = "kline_chart",
+) -> Optional[Dict]:
     """Render a candlestick chart using Plotly with optional signal overlays.
 
     Args:
@@ -149,6 +186,10 @@ def render_candlestick_chart(
         title: Chart title
         height: Chart height in pixels
         analysis_data: Optional list of analysis history items for signal overlay
+        chart_key: Unique key for the chart (enables on_select click handling)
+
+    Returns:
+        Dict with clicked signal details, or None if no marker was clicked.
     """
     import plotly.graph_objects as go
 
@@ -178,11 +219,11 @@ def render_candlestick_chart(
     # Add signal markers if analysis data is provided
     if analysis_data:
         # Prepare marker data for all 5 signal types
-        buy_x, buy_y, buy_text = [], [], []
-        overweight_x, overweight_y, overweight_text = [], [], []
-        hold_x, hold_y, hold_text = [], [], []
-        underweight_x, underweight_y, underweight_text = [], [], []
-        sell_x, sell_y, sell_text = [], [], []
+        buy_x, buy_y, buy_text, buy_cd = [], [], [], []
+        overweight_x, overweight_y, overweight_text, overweight_cd = [], [], [], []
+        hold_x, hold_y, hold_text, hold_cd = [], [], [], []
+        underweight_x, underweight_y, underweight_text, underweight_cd = [], [], [], []
+        sell_x, sell_y, sell_text, sell_cd = [], [], [], []
 
         for item in analysis_data:
             signal = item.get("signal", "")
@@ -217,6 +258,7 @@ def render_candlestick_chart(
                     buy_y.append(y_pos)
                     conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
                     buy_text.append(f"BUY<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"BUY<br>{conf_str}")
+                    buy_cd.append([json.dumps({"signal": "BUY", "confidence": confidence, "timestamp": timestamp, "price": price})])
                 elif signal == "SELL":
                     # Position at low - small offset
                     y_pos = df.iloc[closest_idx]["low"] * 0.998 if price is None else price * 0.998
@@ -224,6 +266,7 @@ def render_candlestick_chart(
                     sell_y.append(y_pos)
                     conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
                     sell_text.append(f"SELL<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"SELL<br>{conf_str}")
+                    sell_cd.append([json.dumps({"signal": "SELL", "confidence": confidence, "timestamp": timestamp, "price": price})])
                 elif signal == "OVERWEIGHT":
                     # Position at high + small offset (similar to BUY but less aggressive)
                     y_pos = df.iloc[closest_idx]["high"] * 1.001 if price is None else price * 1.001
@@ -231,6 +274,7 @@ def render_candlestick_chart(
                     overweight_y.append(y_pos)
                     conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
                     overweight_text.append(f"增持<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"增持<br>{conf_str}")
+                    overweight_cd.append([json.dumps({"signal": "OVERWEIGHT", "confidence": confidence, "timestamp": timestamp, "price": price})])
                 elif signal == "HOLD":
                     # Position at close
                     y_pos = df.iloc[closest_idx]["close"] if price is None else price
@@ -238,6 +282,7 @@ def render_candlestick_chart(
                     hold_y.append(y_pos)
                     conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
                     hold_text.append(f"HOLD<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"HOLD<br>{conf_str}")
+                    hold_cd.append([json.dumps({"signal": "HOLD", "confidence": confidence, "timestamp": timestamp, "price": price})])
                 elif signal == "UNDERWEIGHT":
                     # Position at low - small offset (similar to SELL but less aggressive)
                     y_pos = df.iloc[closest_idx]["low"] * 0.999 if price is None else price * 0.999
@@ -245,6 +290,7 @@ def render_candlestick_chart(
                     underweight_y.append(y_pos)
                     conf_str = f"置信度: {confidence:.0%}" if confidence is not None else ""
                     underweight_text.append(f"减持<br>{conf_str}<br>价格: ¥{price:.2f}" if price else f"减持<br>{conf_str}")
+                    underweight_cd.append([json.dumps({"signal": "UNDERWEIGHT", "confidence": confidence, "timestamp": timestamp, "price": price})])
             except Exception:
                 continue  # Skip items that fail to parse
 
@@ -254,6 +300,7 @@ def render_candlestick_chart(
                 x=buy_x,
                 y=buy_y,
                 mode="markers",
+                customdata=buy_cd,
                 marker=dict(
                     symbol="triangle-up",
                     size=14,
@@ -272,6 +319,7 @@ def render_candlestick_chart(
                 x=sell_x,
                 y=sell_y,
                 mode="markers",
+                customdata=sell_cd,
                 marker=dict(
                     symbol="triangle-down",
                     size=14,
@@ -290,6 +338,7 @@ def render_candlestick_chart(
                 x=hold_x,
                 y=hold_y,
                 mode="markers",
+                customdata=hold_cd,
                 marker=dict(
                     symbol="diamond",
                     size=12,
@@ -308,6 +357,7 @@ def render_candlestick_chart(
                 x=overweight_x,
                 y=overweight_y,
                 mode="markers",
+                customdata=overweight_cd,
                 marker=dict(
                     symbol="triangle-up",
                     size=11,
@@ -326,6 +376,7 @@ def render_candlestick_chart(
                 x=underweight_x,
                 y=underweight_y,
                 mode="markers",
+                customdata=underweight_cd,
                 marker=dict(
                     symbol="triangle-down",
                     size=11,
@@ -368,13 +419,38 @@ def render_candlestick_chart(
     st.plotly_chart(
         fig,
         use_container_width=True,
+        key=chart_key,
+        on_select="rerun",
         config={
             'displayModeBar': False,       # hide toolbar for cleaner look
             'scrollZoom': False,
             'staticPlot': False,
             'responsive': True,
+            'select2d': False,             # disable 2D select (only point click)
         },
     )
+
+    # --- Handle signal marker click ---
+    selected_signal: Optional[Dict] = None
+    try:
+        event = st.session_state.get(chart_key)
+        if event is not None and hasattr(event, 'selection') and event.selection is not None:
+            for point in getattr(event.selection, 'points', []):
+                cd = getattr(point, 'customdata', None)
+                if cd and len(cd) > 0:
+                    selected_signal = json.loads(cd[0])
+                    break
+    except Exception:
+        pass
+
+    if selected_signal:
+        st.session_state['selected_signal'] = selected_signal
+
+    # Show caption when no analysis data has been loaded
+    if not analysis_data:
+        st.caption("尚无AI信号，请先运行分析")
+
+    return selected_signal
 
 
 def format_signal(signal: str, confidence: float) -> str:
@@ -418,14 +494,78 @@ def get_signal_color(signal: str) -> str:
     return color_map.get(signal, '#9E9E9E')
 
 
-def get_next_analysis_text(is_high_freq: bool, high_freq_until: Optional[datetime]) -> str:
-    """Get next analysis countdown text."""
+def _is_market_open() -> bool:
+    """Check if A-share market is currently open (9:20-11:30, 13:00-15:00 CST).
+
+    Returns:
+        True if market is open, False otherwise.
+    """
+    now = datetime.utcnow()
+    # Convert to CST (UTC+8)
+    cst_hour = (now.hour + 8) % 24
+    # Monday=0 ... Friday=4
+    weekday = now.weekday()
+    if weekday >= 5:
+        return False
+    # Morning session: 9:20-11:30
+    if (cst_hour == 9 and now.minute >= 20) or (10 <= cst_hour <= 11 and (cst_hour < 11 or now.minute <= 30)):
+        return True
+    # Afternoon session: 13:00-15:00
+    if 13 <= cst_hour <= 14 or (cst_hour == 15 and now.minute == 0):
+        return True
+    return False
+
+
+def get_next_analysis_text(
+    is_high_freq: bool,
+    high_freq_until: Optional[datetime],
+    last_analysis_at: Optional[str] = None,
+) -> str:
+    """Get next analysis countdown text with real-time calculation.
+
+    Args:
+        is_high_freq: Whether the stock is in high-frequency mode.
+        high_freq_until: Timestamp when high-frequency mode expires.
+        last_analysis_at: ISO timestamp of the last analysis.
+
+    Returns:
+        Formatted countdown string, e.g. "⚡变盘 1:23" or "⏱️4:12".
+    """
+    # High-frequency mode with remaining time
     if is_high_freq and high_freq_until:
         remaining = high_freq_until - datetime.utcnow()
         if remaining.total_seconds() > 0:
-            minutes = int(remaining.total_seconds() / 60)
-            return f"⚡变盘 ({minutes}分钟)"
-    return "⏱️5分钟"
+            total_sec = int(remaining.total_seconds())
+            minutes = total_sec // 60
+            seconds = total_sec % 60
+            if minutes > 0:
+                return f"⚡变盘 {minutes}:{seconds:02d}"
+            return f"⚡变盘 {seconds}秒"
+
+    # Normal mode — estimate based on last analysis or fixed interval
+    if _is_market_open():
+        interval = 120 if is_high_freq else 300
+        # If we have last_analysis_at, calculate actual remaining time
+        if last_analysis_at:
+            try:
+                last_dt = datetime.fromisoformat(last_analysis_at.replace('Z', '+00:00')).replace(tzinfo=None)
+                elapsed = (datetime.utcnow() - last_dt).total_seconds()
+                remaining = max(0, interval - int(elapsed))
+                mins = remaining // 60
+                secs = remaining % 60
+                if is_high_freq:
+                    return f"⚡高频 {mins}:{secs:02d}"
+                return f"⏱️{mins}:{secs:02d}"
+            except Exception:
+                pass
+        # Fallback to static interval
+        mins = interval // 60
+        if is_high_freq:
+            return f"⚡高频 {mins}:00"
+        return f"⏱️{mins}:00"
+
+    # Market closed
+    return "💤 收盘后"
 
 
 def format_turning_alert(alert: dict) -> str:
@@ -458,9 +598,30 @@ def load_watchlist() -> List[Dict[str, Any]]:
         resp = requests.get(f"{API_URL}/api/v1/watchlist/", timeout=5)
         if resp.status_code == 200:
             return resp.json()
-    except Exception as e:
+    except Exception:
         traceback.print_exc(file=sys.stderr)
     return []
+
+
+def update_watchlist_stock(stock_id: int, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Update a watchlist stock."""
+    try:
+        resp = requests.put(
+            f"{API_URL}/api/v1/watchlist/{stock_id}",
+            json=payload,
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 404:
+            st.error("股票不存在")
+        else:
+            detail = resp.json().get("detail", f"HTTP {resp.status_code}")
+            st.error(f"更新失败: {detail}")
+    except Exception as e:
+        st.error(f"更新失败: {str(e)}")
+        traceback.print_exc(file=sys.stderr)
+    return None
 
 
 def add_watchlist_stock(symbol: str, name: str = "", exchange: str = "CN") -> Optional[Dict]:
@@ -512,11 +673,190 @@ def trigger_quick_analysis(stock_id: int) -> Optional[Dict]:
             timeout=5
         )
         if resp.status_code == 202 or resp.status_code == 200:
+            # Mark pending so auto-refresh can detect completion
+            mark_analysis_pending(stock_id)
             return resp.json()
         else:
             st.error(f"分析触发失败: HTTP {resp.status_code}")
     except Exception as e:
         st.error(f"分析触发失败: {str(e)}")
+        traceback.print_exc(file=sys.stderr)
+    return None
+
+
+def trigger_incremental_analysis(stock_id: int, symbol: str) -> None:
+    """Trigger incremental analysis with manual analyst selection.
+
+    Flow:
+    1. Call precheck to detect data changes
+    2. Show results in an expander with manual override
+    3. Execute incremental analysis for selected analysts
+
+    Args:
+        stock_id: Watchlist item ID.
+        symbol: Stock symbol (for display).
+    """
+    # Step 1: Precheck
+    with st.spinner("检测数据变化..."):
+        try:
+            resp = requests.post(
+                f"{API_URL}/api/v1/watchlist/{stock_id}/incremental-analyze/precheck",
+                timeout=10,
+            )
+            precheck = resp.json()
+        except requests.exceptions.Timeout:
+            st.error("预检超时，请检查API服务状态")
+            return
+        except Exception as e:
+            st.error(f"预检失败: {str(e)}")
+            traceback.print_exc(file=sys.stderr)
+            return
+
+    if "error" in precheck:
+        st.error(precheck["error"])
+        return
+
+    needs_refresh = precheck.get("needs_refresh", [])
+    cached = precheck.get("cached", [])
+    all_cached = precheck.get("all_cached", False)
+
+    # Display label for the analyst types
+    analyst_labels = {
+        "market": "📈 市场分析",
+        "news": "📰 新闻分析",
+        "sentiment": "💭 情绪分析",
+        "fundamentals": "📊 基本面分析",
+    }
+
+    # Step 2: Show results + manual selection
+    with st.expander("🔍 检测结果", expanded=True):
+        # Needs refresh
+        if needs_refresh:
+            refresh_display = [analyst_labels.get(a, a) for a in needs_refresh]
+            st.markdown(f"**需要刷新**: {', '.join(refresh_display)}")
+        else:
+            st.markdown("**需要刷新**: 无")
+
+        # Cached
+        if cached:
+            cached_display = [analyst_labels.get(a, a) for a in cached]
+            st.markdown(f"**缓存有效**: {', '.join(cached_display)}")
+        else:
+            st.markdown("**缓存有效**: 无")
+
+        if all_cached:
+            st.info("所有分析师数据均无变化，无需刷新。")
+
+        # Manual override: multiselect with labeled analyst types
+        all_analysts = needs_refresh + cached
+        default_selected = list(needs_refresh)
+
+        # Use raw analyst keys internally, display labels to user
+        options_map = {analyst_labels.get(a, a): a for a in all_analysts}
+        selected_labels = st.multiselect(
+            "选择要强制刷新的分析师 (可选覆盖)",
+            options=list(options_map.keys()),
+            default=[analyst_labels.get(a, a) for a in default_selected],
+            key=f"incr_select_{stock_id}",
+        )
+
+        # Map back to internal keys
+        selected_analysts = [options_map[label] for label in selected_labels]
+
+        # Execute button
+        btn_disabled = len(selected_analysts) == 0
+        if st.button(
+            "🚀 开始增量分析",
+            key=f"incr_exec_{stock_id}",
+            disabled=btn_disabled,
+            type="primary",
+        ):
+            if not selected_analysts:
+                st.error("请至少选择一个分析师")
+                return
+
+            # Step 3: Call actual incremental endpoint (sync, may take 1-3 min)
+            with st.spinner("执行增量分析，请稍候 (通常需要1-3分钟)..."):
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/api/v1/watchlist/{stock_id}/incremental-analyze",
+                        json={"force_refresh_analysts": selected_analysts},
+                        timeout=None,  # CRITICAL: no timeout for sync endpoint
+                    )
+                    result = resp.json()
+                except Exception as e:
+                    st.error(f"增量分析失败: {str(e)}")
+                    traceback.print_exc(file=sys.stderr)
+                    return
+
+            if resp.status_code == 200:
+                refreshed = result.get("refresh_analysts", selected_analysts)
+                refreshed_display = [analyst_labels.get(a, a) for a in refreshed]
+                st.success(f"✅ 增量分析完成！刷新了: {', '.join(refreshed_display)}")
+                st.session_state.watchlist_data = load_watchlist()
+                st.rerun()
+            else:
+                error_msg = result.get("error", result.get("detail", "未知错误"))
+                st.error(f"分析失败: {error_msg}")
+
+
+def fetch_diff_report(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fetch diff report between the two most recent completed analyses for a symbol.
+
+    Calls GET /api/v1/analysis/?symbol=<symbol>&limit=2 to find the two
+    latest completed tasks, then POST /api/v1/analysis/diff-report with
+    those task IDs.
+
+    Args:
+        symbol: Stock symbol (e.g. '000001').
+
+    Returns:
+        Diff report dict with keys ``analysts``, ``decision``,
+        ``confidence``, ``timestamp_range``, or None on failure.
+    """
+    try:
+        # 1. Fetch latest 2 completed analyses for this symbol
+        resp = requests.get(
+            f"{API_URL}/api/v1/analysis/",
+            params={"symbol": symbol, "limit": 2},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            st.error(f"获取分析列表失败: HTTP {resp.status_code}")
+            return None
+
+        tasks: List[Dict] = resp.json()
+        completed = [t for t in tasks if t.get("status") == "COMPLETED"]
+
+        if len(completed) < 2:
+            st.warning(f"{symbol} 至少需要 2 次已完成的分析才能对比 (当前: {len(completed)} 次)")
+            return None
+
+        # The list is already newest-first; task_id_1 = earlier, task_id_2 = later
+        task_id_1 = completed[1]["task_id"]
+        task_id_2 = completed[0]["task_id"]
+
+        # 2. Request diff report
+        diff_resp = requests.post(
+            f"{API_URL}/api/v1/analysis/diff-report",
+            json={"task_id_1": task_id_1, "task_id_2": task_id_2, "symbol": symbol},
+            timeout=15,
+        )
+        if diff_resp.status_code != 200:
+            detail = ""
+            try:
+                detail = diff_resp.json().get("detail", "")
+            except Exception:
+                pass
+            st.error(f"生成差异报告失败: HTTP {diff_resp.status_code} {detail}")
+            return None
+
+        return diff_resp.json()
+
+    except requests.Timeout:
+        st.error("请求超时，请稍后重试")
+    except Exception as e:
+        st.error(f"获取差异报告失败: {str(e)}")
         traceback.print_exc(file=sys.stderr)
     return None
 
@@ -536,34 +876,439 @@ def get_turning_alerts(limit: int = 20) -> List[Dict]:
     return []
 
 
-def fetch_analysis_history(watchlist_id: int, limit: int = 50) -> Optional[List[Dict]]:
-    """Fetch analysis history for a watchlist stock.
+def invalidate_analysis_cache(watchlist_id: int) -> None:
+    """Remove cached analysis history for a watchlist stock.
+
+    Call this after an analysis completes so the next fetch picks up fresh data.
+    """
+    cache_key = f"analysis_history_{watchlist_id}"
+    st.session_state.pop(cache_key, None)
+
+
+def check_analysis_completion(watchlist_id: int) -> bool:
+    """Check if a pending analysis has completed and refresh cache if so.
+
+    Compares the stored ``previous_analysis_at`` timestamp with the current
+    ``last_analysis_at`` from the watchlist record.  When a change is
+    detected, the analysis history cache is invalidated and ``True`` is
+    returned so the caller can trigger a ``st.rerun()``.
 
     Args:
-        watchlist_id: The watchlist item ID
-        limit: Maximum number of records to fetch
+        watchlist_id: The watchlist item ID to check.
 
     Returns:
-        List of analysis history items, or None if fetch fails
+        True if a new analysis was detected (caller should rerun), False otherwise.
+    """
+    pending_key = f"pending_analysis_{watchlist_id}"
+    if not st.session_state.get(pending_key):
+        return False
+
+    # Fetch fresh watchlist item to compare timestamps
+    try:
+        resp = requests.get(f"{API_URL}/api/v1/watchlist/{watchlist_id}", timeout=3)
+        if resp.status_code != 200:
+            return False
+        item = resp.json()
+    except Exception:
+        return False
+
+    current_ts = item.get("last_analysis_at")
+    previous_ts = st.session_state.get(f"previous_analysis_{watchlist_id}")
+
+    if current_ts and current_ts != previous_ts:
+        # New analysis detected — invalidate cache and clean up
+        invalidate_analysis_cache(watchlist_id)
+        st.session_state[f"previous_analysis_{watchlist_id}"] = current_ts
+        st.session_state.pop(pending_key, None)
+        return True
+
+    return False
+
+
+def mark_analysis_pending(watchlist_id: int) -> None:
+    """Record that an analysis was triggered for *watchlist_id*.
+
+    Stores the current ``last_analysis_at`` so
+    :func:`check_analysis_completion` can detect when the new result lands.
     """
     try:
-        resp = requests.get(
-            f"{API_URL}/api/v1/watchlist/{watchlist_id}/analysis-history",
-            params={"limit": limit},
-            timeout=5
-        )
+        resp = requests.get(f"{API_URL}/api/v1/watchlist/{watchlist_id}", timeout=3)
         if resp.status_code == 200:
-            data = resp.json()
-            items = data.get("items", [])
-            # Cache in session state
-            cache_key = f"analysis_history_{watchlist_id}"
-            st.session_state[cache_key] = items
-            return items
-        else:
+            item = resp.json()
+            st.session_state[f"previous_analysis_{watchlist_id}"] = item.get("last_analysis_at")
+    except Exception:
+        pass
+    st.session_state[f"pending_analysis_{watchlist_id}"] = True
+
+
+def fetch_analysis_history(
+    watchlist_id: int,
+    limit: int = 50,
+    *,
+    force_refresh: bool = False,
+) -> Optional[List[Dict]]:
+    """Fetch analysis history for a watchlist stock.
+
+    Checks ``session_state`` cache first.  On miss (or when *force_refresh*
+    is True), calls the API with up to 3 retries for transient errors.
+
+    Args:
+        watchlist_id: The watchlist item ID.
+        limit: Maximum number of records to fetch (1-100).
+        force_refresh: Bypass cache and re-fetch from API.
+
+    Returns:
+        List of analysis history items, or None if all retries fail.
+    """
+    cache_key = f"analysis_history_{watchlist_id}"
+
+    # --- cache hit ---------------------------------------------------------
+    if not force_refresh and cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    # --- fetch with retry ---------------------------------------------------
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.get(
+                f"{API_URL}/api/v1/watchlist/{watchlist_id}/analysis-history",
+                params={"limit": limit},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # API returns wrapped response: {watchlist_id, symbol, items, total, has_more}
+                if isinstance(data, dict) and "items" in data:
+                    items = data["items"]
+                elif isinstance(data, list):
+                    # Backward compat: handle plain list responses
+                    items = data
+                else:
+                    items = []
+                st.session_state[cache_key] = items
+                return items
+            # non-retryable HTTP error
             return None
-    except Exception as e:
-        traceback.print_exc(file=sys.stderr)
-        return None
+        except (ConnectionError, SocketTimeout, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(1)  # wait before retry
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            last_exc = exc
+            break  # non-transient error — don't retry
+
+    # All retries exhausted
+    traceback.print_exc(file=sys.stderr)
+    # Return cached data as fallback even if stale
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    return None
+
+
+def render_notification_settings() -> None:
+    """Render notification settings management section.
+
+    Allows users to configure desktop notification preferences:
+    - Enable/disable notifications
+    - Minimum importance threshold for alerts
+    - Enable/disable sound
+    - Send test notification
+    """
+    with st.expander("🔔 通知设置", expanded=False):
+        st.caption("配置变盘信号桌面通知偏好")
+
+        # Initialize defaults in session_state
+        notif_key = "notification_settings"
+        if notif_key not in st.session_state:
+            st.session_state[notif_key] = {
+                "enabled": True,
+                "min_importance": 0.5,
+                "sound_enabled": True,
+                "analysis_complete": False,
+            }
+        settings = st.session_state[notif_key]
+
+        # --- Toggle: enable notifications ---
+        settings["enabled"] = st.checkbox(
+            "启用桌面通知",
+            value=settings["enabled"],
+            help="变盘信号检测到时发送桌面通知",
+            key="notif_enabled",
+        )
+
+        # --- Minimum importance threshold ---
+        settings["min_importance"] = st.slider(
+            "最低通知重要性",
+            min_value=0.3,
+            max_value=1.0,
+            value=float(settings["min_importance"]),
+            step=0.05,
+            help="只有重要性评分超过此值的变盘信号才会触发通知",
+            key="notif_min_importance",
+            format="%.0f%%",
+        )
+
+        # --- Toggle: sound ---
+        settings["sound_enabled"] = st.checkbox(
+            "通知声音",
+            value=settings["sound_enabled"],
+            help="发送通知时播放提示音",
+            key="notif_sound",
+        )
+
+        # --- Toggle: analysis complete notification ---
+        settings["analysis_complete"] = st.checkbox(
+            "分析完成通知",
+            value=settings["analysis_complete"],
+            help="每次分析完成时发送通知 (不仅限于变盘)",
+            key="notif_analysis_complete",
+        )
+
+        # --- Test notification button ---
+        st.divider()
+        col_test, col_info = st.columns([1, 3])
+        with col_test:
+            if st.button(
+                "📤 发送测试通知",
+                key="notif_test_btn",
+                help="发送一条测试通知以验证通知功能",
+            ):
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/api/v1/watchlist/notification/test",
+                        timeout=5,
+                    )
+                    if resp.status_code == 200:
+                        st.success("测试通知已发送，请检查桌面")
+                    else:
+                        st.warning("通知API不可用，通知将在服务端自动发送")
+                except Exception:
+                    # Fallback: show inline notification toast
+                    st.toast("🔔 测试通知 - TradingAgents 监控系统", icon="🔔")
+                    st.info("桌面通知测试已发送 (Streamlit toast)")
+
+        with col_info:
+            st.caption(
+                "桌面通知由后端服务在检测到变盘时自动发送。"
+                "此处设置控制通知偏好（当前存储在浏览器会话中）。"
+            )
+
+        # --- Summary display ---
+        importance_labels = {
+            range(3, 5): "低 (仅重大变盘)",
+            range(5, 7): "中 (重要变盘)",
+            range(7, 9): "高 (多数变盘)",
+            range(9, 11): "全部 (所有变盘)",
+        }
+        importance_label = "中"
+        imp_pct = int(settings["min_importance"] * 10)
+        for rng, label in importance_labels.items():
+            if imp_pct in rng:
+                importance_label = label
+                break
+
+        st.markdown(
+            f"""
+            <div style="background:rgba(33,150,243,0.08);border:1px solid #2196F3;
+                        border-radius:6px;padding:8px 12px;margin:8px 0;font-size:0.85rem;">
+                <strong>当前配置</strong>: &nbsp;
+                通知 {'✅ 已启用' if settings['enabled'] else '❌ 已禁用'} &nbsp;|&nbsp;
+                最低重要性: <strong>{importance_label}</strong> ({settings['min_importance']:.0%}) &nbsp;|&nbsp;
+                声音 {'🔊 开' if settings['sound_enabled'] else '🔇 关'} &nbsp;|&nbsp;
+                分析完成 {'✅' if settings['analysis_complete'] else '❌'}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_high_freq_status_bar() -> None:
+    """Render a prominent status bar showing stocks currently in high-frequency mode.
+
+    Displays a yellow/red banner listing all stocks that are in high-frequency
+    monitoring mode, with remaining time countdown.
+    """
+    watchlist = st.session_state.get('watchlist_data', [])
+    if not watchlist:
+        return
+
+    # Collect stocks currently in high-frequency mode
+    hf_stocks: List[Dict[str, Any]] = []
+    for item in watchlist:
+        is_hf = item.get('is_high_frequency', False)
+        hf_until_str = item.get('high_freq_until')
+        if not is_hf or not hf_until_str:
+            continue
+        try:
+            hf_until = datetime.fromisoformat(hf_until_str.replace('Z', '+00:00')).replace(tzinfo=None)
+            if hf_until > datetime.utcnow():
+                remaining = hf_until - datetime.utcnow()
+                hf_stocks.append({
+                    'symbol': item.get('symbol', '?'),
+                    'name': item.get('name', ''),
+                    'remaining': remaining,
+                    'importance': item.get('last_confidence', 0),
+                })
+        except Exception:
+            continue
+
+    if not hf_stocks:
+        return
+
+    # Build the status bar
+    stock_lines: List[str] = []
+    for s in hf_stocks:
+        total_sec = int(s['remaining'].total_seconds())
+        mins = total_sec // 60
+        secs = total_sec % 60
+        remaining_text = f"{mins}:{secs:02d}"
+        name = s['name'] or s['symbol']
+        stock_lines.append(
+            f"<strong>{s['symbol']} {name[:6]}</strong>"
+            f" &nbsp;<span style='color:#F44336;font-weight:bold'>⚡ 剩余 {remaining_text}</span>"
+        )
+
+    stocks_html = "<br/>".join(stock_lines)
+    is_urgent = any(s['remaining'].total_seconds() < 180 for s in hf_stocks)
+
+    border_color = "#F44336" if is_urgent else "#FFC107"
+    bg_color = "rgba(255, 82, 82, 0.08)" if is_urgent else "rgba(255, 193, 7, 0.08)"
+    header_text = "🔥 高频监控中 - 紧急" if is_urgent else "⚡ 高频监控中"
+
+    st.markdown(
+        f"""
+        <div style="background-color:{bg_color};
+                    border:1px solid {border_color};
+                    border-radius:6px;
+                    padding:10px 14px;
+                    margin:8px 0;">
+            <div style="font-size:0.85rem;color:#333;margin-bottom:6px;">
+                <strong>{header_text}</strong> &nbsp;
+                <span style="color:#666">({len(hf_stocks)} 只股票处于高频分析模式)</span>
+            </div>
+            <div style="font-size:0.85rem;line-height:1.6;">
+                {stocks_html}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_monitoring_status_overview() -> None:
+    """Render a compact monitoring status overview banner.
+
+    Shows key system metrics:
+    - Total monitored stocks / active count
+    - High-frequency mode count
+    - Market status (open/closed)
+    - Next scheduled analysis time
+    - Alerts today count
+    - Data last updated timestamp
+    """
+    watchlist = st.session_state.get('watchlist_data', [])
+
+    # Calculate metrics
+    total = len(watchlist)
+    active = sum(1 for w in watchlist if w.get('is_active', True))
+    hf_count = 0
+    for w in watchlist:
+        is_hf = w.get('is_high_frequency', False)
+        hf_until_str = w.get('high_freq_until')
+        if is_hf and hf_until_str:
+            try:
+                hf_until = datetime.fromisoformat(hf_until_str.replace('Z', '+00:00')).replace(tzinfo=None)
+                if hf_until > datetime.utcnow():
+                    hf_count += 1
+            except Exception:
+                pass
+
+    market_open = _is_market_open()
+    market_emoji = "🟢" if market_open else "🔴"
+    market_text = "交易中" if market_open else "已收盘"
+
+    # Alerts count from cached alerts
+    alerts = st.session_state.get('turning_alerts', [])
+    alerts_today = 0
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    for a in alerts:
+        alert_time = a.get('time', '')
+        if today_str in alert_time:
+            alerts_today += 1
+
+    # Last data update timestamp
+    last_update = st.session_state.get('watchlist_last_update', '')
+
+    # Build the overview metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric(
+            label="监控股票",
+            value=f"{active}/{total}",
+            help=f"活跃/总数",
+        )
+
+    with col2:
+        hf_color = "#F44336" if hf_count > 0 else "#9E9E9E"
+        st.markdown(
+            f'<div style="text-align:center">'
+            f'<div style="font-size:0.75rem;color:#6B7280">高频模式</div>'
+            f'<div style="font-size:1.2rem;font-weight:700;color:{hf_color}">'
+            f'{"⚡ " + str(hf_count) if hf_count > 0 else "无"}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col3:
+        market_color = "#4CAF50" if market_open else "#F44336"
+        st.markdown(
+            f'<div style="text-align:center">'
+            f'<div style="font-size:0.75rem;color:#6B7280">市场状态</div>'
+            f'<div style="font-size:1.2rem;font-weight:700;color:{market_color}">'
+            f'{market_emoji} {market_text}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col4:
+        alert_color = "#F44336" if alerts_today > 0 else "#9E9E9E"
+        st.markdown(
+            f'<div style="text-align:center">'
+            f'<div style="font-size:0.75rem;color:#6B7280">今日变盘</div>'
+            f'<div style="font-size:1.2rem;font-weight:700;color:{alert_color}">'
+            f'{"🔥 " + str(alerts_today) if alerts_today > 0 else "0"}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    with col5:
+        st.markdown(
+            f'<div style="text-align:center">'
+            f'<div style="font-size:0.75rem;color:#6B7280">数据更新</div>'
+            f'<div style="font-size:0.85rem;color:#6B7280">'
+            f'{last_update if last_update else "--"}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def show_error_banner(message: str, retry_key: str = "retry_btn") -> bool:
+    """Show a styled error banner with retry button.
+
+    Args:
+        message: Error message to display.
+        retry_key: Unique key for the retry button.
+
+    Returns:
+        True if retry button was clicked.
+    """
+    col_msg, col_btn = st.columns([6, 1])
+    with col_msg:
+        st.error(message)
+    with col_btn:
+        return st.button("🔄 重试", key=retry_key, use_container_width=False)
 
 
 def get_scheduler_status() -> Optional[Dict]:
@@ -660,6 +1405,120 @@ def resolve_stock_name(symbol: str) -> str:
     return ""
 
 
+def _has_full_analysis_today(symbol: str) -> bool:
+    """Check if a full analysis was completed today for the given symbol.
+
+    Args:
+        symbol: Stock symbol (e.g. '000001')
+
+    Returns:
+        True if at least one 'full' analysis completed today.
+    """
+    try:
+        today_start = datetime.combine(datetime.utcnow().date(), datetime.min.time()).isoformat()
+        resp = requests.get(
+            f"{API_URL}/api/v1/analysis/",
+            params={
+                "symbol": symbol,
+                "status": "COMPLETED",
+                "since": today_start,
+            },
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            tasks = data if isinstance(data, list) else data.get("items", data.get("tasks", []))
+            for task in tasks:
+                if task.get("analysis_type") == "full":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _has_multiple_analyses_today(symbol: str, minimum: int = 2) -> bool:
+    """Check if at least N analyses exist today for the given symbol.
+
+    Args:
+        symbol: Stock symbol (e.g. '000001')
+        minimum: Minimum number of analyses required (default 2)
+
+    Returns:
+        True if count of completed analyses today >= minimum.
+    """
+    try:
+        today_start = datetime.combine(datetime.utcnow().date(), datetime.min.time()).isoformat()
+        resp = requests.get(
+            f"{API_URL}/api/v1/analysis/",
+            params={
+                "symbol": symbol,
+                "status": "COMPLETED",
+                "since": today_start,
+            },
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            tasks = data if isinstance(data, list) else data.get("items", data.get("tasks", []))
+            return len(tasks) >= minimum
+    except Exception:
+        pass
+    return False
+
+
+def _is_analysis_running(symbol: str) -> bool:
+    """Check if any analysis task is currently RUNNING or PENDING for the symbol.
+
+    Args:
+        symbol: Stock symbol (e.g. '000001')
+
+    Returns:
+        True if a task with RUNNING or PENDING status exists for this symbol.
+    """
+    try:
+        resp = requests.get(
+            f"{API_URL}/api/v1/analysis/",
+            params={"symbol": symbol},
+            timeout=3,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            tasks = data if isinstance(data, list) else data.get("items", data.get("tasks", []))
+            for task in tasks:
+                status = task.get("status", "").upper()
+                if status in ("RUNNING", "PENDING"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def trigger_full_analysis(symbol: str, force_refresh: bool = False) -> Optional[Dict]:
+    """Trigger a full analysis for a stock via the watchlist analyze endpoint.
+
+    Args:
+        symbol: Stock symbol (e.g. '000001')
+        force_refresh: Whether to bypass analyst cache
+
+    Returns:
+        Response dict if successful, None otherwise.
+    """
+    try:
+        resp = requests.post(
+            f"{API_URL}/api/v1/watchlist/analyze",
+            params={"symbol": symbol, "force_refresh": force_refresh},
+            timeout=5,
+        )
+        if resp.status_code in (200, 202):
+            return resp.json()
+        else:
+            st.error(f"全量分析触发失败: HTTP {resp.status_code}")
+    except Exception as e:
+        st.error(f"全量分析触发失败: {str(e)}")
+        traceback.print_exc(file=sys.stderr)
+    return None
+
+
 def render_add_stock_section():
     """Render search and add stock section."""
     st.subheader("🔍 添加自选股")
@@ -697,7 +1556,7 @@ def render_add_stock_section():
         unsafe_allow_html=True
     )
     
-    col1, col2, col3 = st.columns([3, 2, 1])
+    col1, col2, col3, col4 = st.columns([3, 1, 2, 1])
 
     with col1:
         search_symbol = st.text_input(
@@ -719,6 +1578,27 @@ def render_add_stock_section():
         resolved_name = st.session_state.get(cache_key, "")
     
     with col2:
+        search_clicked = st.button(
+            "搜索",
+            use_container_width=True,
+            key="search_watchlist_btn"
+        )
+
+    if search_clicked:
+        if not search_symbol:
+            st.warning("请输入股票代码")
+        elif len(search_symbol.strip()) == 6 and search_symbol.strip().isdigit():
+            with st.spinner("正在搜索股票..."):
+                resolved_name = resolve_stock_name(search_symbol.strip())
+                if resolved_name:
+                    st.session_state[f"_resolved_name_{search_symbol.strip()}"] = resolved_name
+                    st.success(f"已找到: {search_symbol.strip()} {resolved_name}")
+                else:
+                    st.warning("未找到对应股票，请检查代码")
+        else:
+            st.warning("请输入6位A股代码")
+
+    with col3:
         if resolved_name:
             # Show resolved name as read-only styled box - single markdown call
             st.markdown(
@@ -736,7 +1616,7 @@ def render_add_stock_section():
         user_input_name = st.session_state.get("watchlist_name", "")
         final_name = resolved_name if resolved_name else user_input_name
     
-    with col3:
+    with col4:
         # Simple button without wrapper divs
         button_clicked = st.button(
             "➕ 添加",
@@ -759,10 +1639,53 @@ def render_add_stock_section():
                     st.session_state.pop(cache_key, None)
                     st.session_state.pop("watchlist_name", None)
                     st.session_state.pop("watchlist_search", None)
-                    time.sleep(0.5)
                     st.rerun()
             else:
                 st.warning("请输入股票代码")
+
+
+def render_edit_stock_modal() -> None:
+    """Render watchlist edit modal."""
+    if not st.session_state.get("show_edit_stock") or not st.session_state.get("selected_stock"):
+        return
+
+    item = st.session_state.selected_stock
+    stock_id = item.get("id", 0)
+    symbol = item.get("symbol", "Unknown")
+
+    with st.expander(f"✏️ 编辑 {symbol}", expanded=True):
+        edited_name = st.text_input(
+            "股票名称",
+            value=item.get("name") or "",
+            key=f"edit_name_{stock_id}",
+        )
+        edited_exchange = st.selectbox(
+            "交易所",
+            options=["CN", "SZ", "SH"],
+            index=max(["CN", "SZ", "SH"].index(item.get("exchange")) if item.get("exchange") in ["CN", "SZ", "SH"] else 0, 0),
+            key=f"edit_exchange_{stock_id}",
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("保存编辑", key=f"save_edit_{stock_id}", type="primary"):
+                updated = update_watchlist_stock(
+                    stock_id,
+                    {
+                        "name": edited_name,
+                        "exchange": edited_exchange,
+                    },
+                )
+                if updated:
+                    st.session_state.show_edit_stock = False
+                    st.session_state.selected_stock = updated
+                    st.session_state.watchlist_data = load_watchlist()
+                    st.success(f"已更新 {symbol}")
+                    st.rerun()
+        with col2:
+            if st.button("取消编辑", key=f"cancel_edit_{stock_id}"):
+                st.session_state.show_edit_stock = False
+                st.rerun()
 
 
 def render_watchlist_table():
@@ -875,8 +1798,10 @@ def render_watchlist_table():
             st.markdown(f"<span style='color: {signal_color}; font-weight: bold;'>{signal_text}</span>", unsafe_allow_html=True)
         
         with row_cols[5]:
-            next_analysis = get_next_analysis_text(is_high_freq, high_freq_until)
-            st.write(next_analysis)
+            last_analysis_at = item.get('last_analysis_at')
+            next_analysis = get_next_analysis_text(is_high_freq, high_freq_until, last_analysis_at)
+            next_color = "#F44336" if "变盘" in next_analysis else "#2196F3" if "高频" in next_analysis else "#9E9E9E"
+            st.markdown(f"<span style='color: {next_color}'>{next_analysis}</span>", unsafe_allow_html=True)
         
         with row_cols[6]:
             if st.button("👁️", key=f"view_stock_{stock_id}", help="查看详情"):
@@ -884,22 +1809,67 @@ def render_watchlist_table():
                 st.session_state.show_stock_detail = True
         
         with row_cols[7]:
-            if st.button("🔄", key=f"analyze_stock_{stock_id}", help="立即分析"):
-                with st.spinner("启动分析..."):
-                    result = trigger_quick_analysis(stock_id)
-                    if result:
-                        st.success(f"分析已启动: {result.get('analysis_id', 'N/A')[:8]}...")
-                        time.sleep(1)
-                        st.rerun()
+            # Three-button analysis layout: 全量 / 增量 / 差异
+            force_refresh = st.checkbox(
+                "强刷",
+                key=f"force_refresh_{stock_id}",
+                help="忽略缓存，重新执行全部分析",
+            )
+            btn_cols = st.columns([0.7, 0.7, 0.7])
+
+            # Compute button states
+            is_analyzing = _is_analysis_running(symbol)
+            has_full_today = _has_full_analysis_today(symbol)
+            has_multiple = _has_multiple_analyses_today(symbol)
+
+            full_disabled = is_analyzing
+            incr_disabled = not has_full_today or is_analyzing
+            diff_disabled = not has_multiple or is_analyzing
+
+            with btn_cols[0]:
+                if full_disabled:
+                    st.button(
+                        "全量",
+                        key=f"full_btn_{stock_id}",
+                        disabled=True,
+                        help="分析正在运行中" if is_analyzing else "",
+                    )
+                else:
+                    if st.button("全量", key=f"full_btn_{stock_id}", help="启动全量分析"):
+                        with st.spinner("全量分析中..."):
+                            result = trigger_full_analysis(symbol, force_refresh=force_refresh)
+                        if result:
+                            st.success("全量分析已启动")
+                            st.rerun()
+
+            with btn_cols[1]:
+                incr_help = "需先完成今日全量分析" if not has_full_today else ("分析正在运行中" if is_analyzing else "启动增量分析")
+                if st.button("增量", key=f"incr_btn_{stock_id}", disabled=incr_disabled, help=incr_help):
+                    trigger_incremental_analysis(stock_id, symbol)
+
+            with btn_cols[2]:
+                diff_help = "需要至少两次分析记录" if not has_multiple else ("分析正在运行中" if is_analyzing else "查看分析差异")
+                if st.button("差异", key=f"diff_btn_{stock_id}", disabled=diff_disabled, help=diff_help):
+                    with st.spinner("生成差异报告..."):
+                        report = fetch_diff_report(symbol)
+                    st.session_state.diff_report_data = report
+                    st.session_state.diff_symbol = symbol
+                    st.session_state.show_diff_modal = True
+                    st.rerun()
         
         with row_cols[8]:
             # Management buttons
-            mgmt_cols = st.columns(2)
+            mgmt_cols = st.columns(3)
             with mgmt_cols[0]:
+                if st.button("✏️", key=f"edit_stock_{stock_id}", help="编辑"):
+                    st.session_state.selected_stock = item
+                    st.session_state.show_edit_stock = True
+                    st.rerun()
+            with mgmt_cols[1]:
                 if st.button("⚙️", key=f"settings_stock_{stock_id}", help="设置"):
                     st.session_state.selected_stock = item
                     st.session_state.show_stock_settings = True
-            with mgmt_cols[1]:
+            with mgmt_cols[2]:
                 # Use a unique key for each delete button confirmation
                 confirm_key = f"confirm_delete_{stock_id}"
                 if confirm_key not in st.session_state:
@@ -934,7 +1904,7 @@ def render_control_buttons():
     """Render control buttons for monitoring."""
     st.subheader("🎛️ 监控控制")
 
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 2])
 
     # Initialize monitoring state from API on page load
     if 'monitoring_state_initialized' not in st.session_state:
@@ -947,14 +1917,12 @@ def render_control_buttons():
                 if start_monitoring():
                     st.session_state.monitoring_active = True
                     st.success("监控已启动")
-                    time.sleep(0.5)
                     st.rerun()
         else:
             if st.button("⏸️ 暂停监控", use_container_width=True):
                 if stop_monitoring():
                     st.session_state.monitoring_active = False
                     st.warning("监控已暂停")
-                    time.sleep(0.5)
                     st.rerun()
     
     with col2:
@@ -973,7 +1941,6 @@ def render_control_buttons():
                 progress_text.empty()
                 progress_bar.empty()
                 st.success(f"已启动 {len(watchlist)} 个分析任务")
-                time.sleep(1)
                 st.rerun()
             else:
                 st.warning("自选股列表为空")
@@ -981,6 +1948,7 @@ def render_control_buttons():
     with col3:
         if st.button("🔄 刷新列表", use_container_width=True):
             st.session_state.watchlist_data = load_watchlist()
+            st.session_state.watchlist_last_update = datetime.utcnow().strftime("%H:%M:%S")
             st.rerun()
     
     with col4:
@@ -994,7 +1962,8 @@ def render_control_buttons():
             key="auto_refresh_toggle"
         )
         st.session_state.auto_refresh = auto_refresh
-        
+    
+    with col5:
         # Show scheduler status
         scheduler_status = get_scheduler_status()
         if scheduler_status:
@@ -1003,6 +1972,8 @@ def render_control_buttons():
             status_text = "运行中" if is_running else "已停止"
             active_jobs = scheduler_status.get('active_jobs', 0)
             st.caption(f"{status_emoji} 调度器: {status_text} ({active_jobs} 个活跃任务)")
+        else:
+            st.caption("🔴 调度器: 未连接")
 
 
 def render_monitoring_panel():
@@ -1015,6 +1986,15 @@ def render_monitoring_panel():
     if not watchlist:
         st.info("添加股票以查看实时面板")
         return
+
+    # Check if any pending analyses have completed → invalidate cache
+    _need_rerun = False
+    for item in watchlist:
+        wid = item.get("id")
+        if wid and check_analysis_completion(wid):
+            _need_rerun = True
+    if _need_rerun:
+        st.rerun()
 
     # Initialize session state for multi-select
     if 'monitoring_selected_stocks' not in st.session_state:
@@ -1047,12 +2027,28 @@ def render_monitoring_panel():
                     stock_id = stock.get('id')
                     analysis_data = None
                     if stock_id:
-                        analysis_data = fetch_analysis_history(stock_id)
-                        if analysis_data is None and f"analysis_history_{stock_id}" in st.session_state:
-                            # Use cached data if fetch failed
-                            analysis_data = st.session_state[f"analysis_history_{stock_id}"]
+                        with st.spinner("加载分析数据中..."):
+                            analysis_data = fetch_analysis_history(stock_id)
+                        if analysis_data is None:
+                            # Show error banner with retry option
+                            if show_error_banner(
+                                "⚠️ 分析数据获取失败",
+                                retry_key=f"retry_monitor_{stock_id}",
+                            ):
+                                st.session_state.pop(
+                                    f"analysis_history_{stock_id}", None
+                                )
+                                st.rerun()
+                            # Fall back to stale cache if available
+                            if f"analysis_history_{stock_id}" in st.session_state:
+                                analysis_data = st.session_state[f"analysis_history_{stock_id}"]
 
-                    render_candlestick_chart(df, analysis_data=analysis_data, height=350)
+                    clicked = render_candlestick_chart(df, analysis_data=analysis_data, height=350, chart_key=f"monitor_chart_{stock_id}")
+                    # If a signal marker was clicked, open detail modal for this stock
+                    if clicked and stock_id:
+                        st.session_state.selected_stock = stock
+                        st.session_state.show_stock_detail = True
+                        st.rerun()
                 else:
                     st.caption("暂无数据")
 
@@ -1116,10 +2112,18 @@ def render_monitoring_panel():
             watchlist_id = selected_item.get('id')
             analysis_data = None
             if watchlist_id:
-                analysis_data = fetch_analysis_history(watchlist_id)
+                with st.spinner("加载分析数据中..."):
+                    analysis_data = fetch_analysis_history(watchlist_id)
                 if analysis_data is None:
-                    # Show warning but still display chart
-                    st.warning("⚠️ 分析历史数据获取失败，仅显示价格走势")
+                    # Show error banner with retry
+                    if show_error_banner(
+                        "⚠️ 分析历史数据获取失败，仅显示价格走势",
+                        retry_key=f"retry_detail_{watchlist_id}",
+                    ):
+                        st.session_state.pop(
+                            f"analysis_history_{watchlist_id}", None
+                        )
+                        st.rerun()
                     # Try to use cached data
                     cache_key = f"analysis_history_{watchlist_id}"
                     if cache_key in st.session_state:
@@ -1130,8 +2134,34 @@ def render_monitoring_panel():
                 detail_df,
                 title=f"{symbol} {name} 分时K线",
                 height=400,
-                analysis_data=analysis_data
+                analysis_data=analysis_data,
+                chart_key=f"detail_chart_{watchlist_id}",
             )
+
+            # Show clicked signal details below chart
+            clicked_signal = st.session_state.get('selected_signal')
+            if clicked_signal and clicked_signal.get('timestamp'):
+                sig = clicked_signal.get('signal', 'UNKNOWN')
+                conf = clicked_signal.get('confidence', 0)
+                price = clicked_signal.get('price')
+                ts = clicked_signal.get('timestamp', '')
+                sig_color = get_signal_color(sig)
+                try:
+                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    time_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    time_str = ts[:16] if ts else ""
+                price_str = f"¥{price:.2f}" if price else "--"
+                st.markdown(
+                    f'<div style="background:rgba(33,150,243,0.08);border:1px solid #2196F3;'
+                    f'border-radius:8px;padding:10px 14px;margin:8px 0">'
+                    f'<strong>📌 点击的信号</strong><br/>'
+                    f'<span style="color:{sig_color};font-weight:bold;font-size:1.1em">'
+                    f'{format_signal(sig, conf)}</span>'
+                    f' &nbsp;|&nbsp; 价格: {price_str} &nbsp;|&nbsp; 时间: {time_str}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
         else:
             st.caption("暂无价格数据")
 
@@ -1261,9 +2291,94 @@ def render_stock_detail_modal():
                 turning_enabled = item.get('turning_detection_enabled', True)
                 st.write(f"变盘检测: {'✅' if turning_enabled else '❌'}")
             
-            # Analysis history placeholder
-            st.write("**分析历史**")
-            st.info("分析历史功能开发中...")
+            # Analysis history with K-line chart
+            st.write("**分析历史 & K线信号**")
+            watchlist_id = item.get('id')
+            if watchlist_id:
+                with st.spinner("加载分析数据中..."):
+                    analysis_data = fetch_analysis_history(watchlist_id)
+
+                if analysis_data is None:
+                    if show_error_banner(
+                        "⚠️ 分析历史数据获取失败",
+                        retry_key=f"retry_modal_history_{watchlist_id}"
+                    ):
+                        st.session_state.pop(
+                            f"analysis_history_{watchlist_id}", None
+                        )
+                        st.rerun()
+                else:
+                    # Show K-line chart with signals and trajectory
+                    symbol = item.get('symbol', 'Unknown')
+                    name = item.get('name', symbol)
+                    detail_df = get_stock_intraday_data(symbol)
+                    if detail_df is not None and not detail_df.empty:
+                        render_candlestick_chart(
+                            detail_df,
+                            title=f"{symbol} {name}",
+                            height=350,
+                            analysis_data=analysis_data,
+                            chart_key=f"modal_chart_{watchlist_id}",
+                        )
+                    else:
+                        st.caption("暂无价格数据")
+
+                    # Show analysis history table
+                    if analysis_data:
+                        st.write("**历史信号记录**")
+
+                        # Determine which record to highlight (if any)
+                        clicked_signal = st.session_state.get('selected_signal')
+                        highlight_ts = ""
+                        if clicked_signal and clicked_signal.get('timestamp'):
+                            highlight_ts = clicked_signal['timestamp']
+
+                        for rec in analysis_data[:10]:
+                            ts = rec.get("timestamp", "")
+                            sig = rec.get("signal", "UNKNOWN")
+                            conf = rec.get("confidence", 0)
+                            price = rec.get("price")
+                            err = rec.get("error_message")
+                            sig_color = get_signal_color(sig)
+                            time_str = ""
+                            if ts:
+                                try:
+                                    dt = datetime.fromisoformat(
+                                        ts.replace('Z', '+00:00')
+                                    )
+                                    time_str = dt.strftime("%m/%d %H:%M")
+                                except Exception:
+                                    time_str = ts[:16]
+
+                            # Highlight the record matching the clicked signal
+                            is_highlighted = highlight_ts and ts and highlight_ts == ts
+                            if is_highlighted:
+                                border = "border:2px solid #2196F3;border-radius:6px;padding:6px 10px;background:rgba(33,150,243,0.06);margin:4px 0"
+                            else:
+                                border = ""
+
+                            if err:
+                                st.markdown(
+                                    f"<div style='{border}'><span style='color:#F44336'>"
+                                    f"❌ {time_str} 分析失败: {err}</span></div>",
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                price_str = (
+                                    f"¥{price:.2f}" if price else "--"
+                                )
+                                prefix = "📌 " if is_highlighted else ""
+                                st.markdown(
+                                    f"<div style='{border}'><span style='color:{sig_color}'>"
+                                    f"{prefix}{time_str} "
+                                    f"{format_signal(sig, conf)} "
+                                    f"@ {price_str}</span></div>",
+                                    unsafe_allow_html=True,
+                                )
+                    else:
+                        st.caption("尚无AI信号，请先运行分析")
+            else:
+                st.caption("无效的股票ID")
             
             if st.button("关闭", key="close_detail"):
                 st.session_state.show_stock_detail = False
@@ -1324,7 +2439,6 @@ def render_stock_settings_modal():
                         if resp.status_code == 200:
                             st.success("设置已保存")
                             st.session_state.show_stock_settings = False
-                            time.sleep(0.5)
                             st.rerun()
                         else:
                             st.error(f"保存失败: HTTP {resp.status_code}")
@@ -1337,50 +2451,219 @@ def render_stock_settings_modal():
                     st.rerun()
 
 
+def render_diff_modal() -> None:
+    """Render diff report modal using st.expander.
+
+    Displayed when ``st.session_state['show_diff_modal']`` is truthy.
+    Reads the diff report from ``st.session_state['diff_report_data']``
+    (pre-fetched on button click to avoid expensive calls every rerun).
+    """
+    if not st.session_state.get('show_diff_modal'):
+        return
+
+    symbol = st.session_state.get('diff_symbol', '')
+    report = st.session_state.get('diff_report_data')
+
+    with st.expander(f"📊 {symbol} 分析差异对比", expanded=True):
+        if report is None:
+            st.caption("报告数据为空。")
+            if st.button("关闭", key="close_diff_empty"):
+                st.session_state.show_diff_modal = False
+                st.rerun()
+            return
+
+        # --- Time range ---
+        ts_range = report.get("timestamp_range", "")
+        if ts_range:
+            st.caption(f"⏱️ 时间范围: {ts_range}")
+
+        # --- Decision comparison ---
+        decision = report.get("decision", {})
+        signal_before = decision.get("signal_before") or "N/A"
+        signal_after = decision.get("signal_after") or "N/A"
+        signal_changed = decision.get("signal_changed", False)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            before_color = "#F44336" if signal_before in ("BUY", "SELL") else "#FFC107" if signal_before == "HOLD" else "#9E9E9E"
+            st.markdown(
+                f"<div style='text-align:center'>"
+                f"<div style='font-size:0.85rem;color:#6B7280'>之前信号</div>"
+                f"<div style='font-size:1.4rem;font-weight:700;color:{before_color}'>{signal_before}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with col2:
+            after_color = "#4CAF50" if signal_after == "BUY" else "#F44336" if signal_after == "SELL" else "#FFC107" if signal_after == "HOLD" else "#9E9E9E"
+            delta_text = "🔄 变化" if signal_changed else "— 无变化"
+            st.markdown(
+                f"<div style='text-align:center'>"
+                f"<div style='font-size:0.85rem;color:#6B7280'>之后信号</div>"
+                f"<div style='font-size:1.4rem;font-weight:700;color:{after_color}'>{signal_after}</div>"
+                f"<div style='font-size:0.8rem;color:#6B7280'>{delta_text}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # --- Confidence comparison ---
+        confidence = report.get("confidence", {})
+        conf_before = confidence.get("before")
+        conf_after = confidence.get("after")
+        conf_delta = confidence.get("delta")
+        if conf_before is not None and conf_after is not None:
+            delta_str = f"{conf_delta:+.0%}" if conf_delta is not None else "N/A"
+            col3, col4 = st.columns(2)
+            with col3:
+                st.metric("之前置信度", f"{conf_before:.0%}")
+            with col4:
+                st.metric("之后置信度", f"{conf_after:.0%}", delta=delta_str)
+
+        st.divider()
+
+        # --- Per-analyst diffs ---
+        analysts = report.get("analysts", {})
+        if not analysts:
+            st.info("无分析师级别的差异。")
+        else:
+            # Friendly name mapping
+            _FRIENDLY_NAMES: Dict[str, str] = {
+                "market_analyst": "市场分析师",
+                "social_analyst": "社交情绪分析师",
+                "news_analyst": "新闻分析师",
+                "fundamentals_analyst": "基本面分析师",
+                "research_manager": "研究经理",
+                "research_debate": "研究辩论",
+                "trader": "交易员",
+                "risk_debate": "风险辩论",
+                "portfolio_manager": "投资组合经理",
+            }
+
+            changed_count = sum(1 for v in analysts.values() if v.get("changed"))
+            st.caption(f"共 {len(analysts)} 个角色，{changed_count} 个有变化")
+
+            for analyst_key, analyst_data in analysts.items():
+                display_name = _FRIENDLY_NAMES.get(analyst_key, analyst_key)
+                changed = analyst_data.get("changed", False)
+                change_type = analyst_data.get("change_type", "unchanged")
+
+                # Choose icon based on change type
+                if not changed:
+                    icon = "⚪"
+                elif change_type == "added":
+                    icon = "🟢"
+                elif change_type == "removed":
+                    icon = "🔴"
+                else:
+                    icon = "🟡"
+
+                with st.expander(f"{icon} {display_name}"):
+                    if not changed:
+                        st.write("无显著变化")
+                    else:
+                        # Price diff if available
+                        price_before = analyst_data.get("price_before")
+                        price_after = analyst_data.get("price_after")
+                        if price_before is not None and price_after is not None:
+                            st.write(f"**价格变化**: ¥{price_before:.2f} → ¥{price_after:.2f}")
+
+                        # Change type badge
+                        _TYPE_LABELS = {
+                            "added": "新增",
+                            "removed": "移除",
+                            "content_changed": "内容变化",
+                        }
+                        type_label = _TYPE_LABELS.get(change_type, change_type)
+                        st.caption(f"变更类型: {type_label}")
+
+                        # Unified diff (if present)
+                        diff_summary = analyst_data.get("diff_summary")
+                        if diff_summary:
+                            st.code(diff_summary, language="diff")
+
+                        # Previews
+                        old_preview = analyst_data.get("old_preview", "")
+                        new_preview = analyst_data.get("new_preview", "")
+                        if old_preview or new_preview:
+                            prev_cols = st.columns(2)
+                            with prev_cols[0]:
+                                if old_preview:
+                                    st.caption("之前内容摘要")
+                                    st.text(old_preview[:300])
+                            with prev_cols[1]:
+                                if new_preview:
+                                    st.caption("之后内容摘要")
+                                    st.text(new_preview[:300])
+
+        # Close button
+        if st.button("关闭", key="close_diff"):
+            st.session_state.show_diff_modal = False
+            st.session_state.diff_report_data = None
+            st.session_state.diff_symbol = None
+            st.rerun()
+
+
 def render_watchlist_manager():
     """Main entry point for watchlist management page."""
     try:
         st.title("📊 自选股实时监控")
         st.caption("AI驱动变盘检测")
         
+        # --- Monitoring Status Overview (compact banner) ---
+        render_monitoring_status_overview()
+        
         st.divider()
         
-        # Search and add section
+        # --- High-Frequency Mode Status Bar (prominent, only shown when active) ---
+        render_high_freq_status_bar()
+        
+        # --- Search and add section ---
         render_add_stock_section()
         
         st.divider()
         
-        # Watchlist table
+        # --- Watchlist table ---
         render_watchlist_table()
         
         st.divider()
         
-        # Control buttons
+        # --- Control buttons ---
         render_control_buttons()
         
         st.divider()
         
-        # Real-time monitoring panel
+        # --- Real-time monitoring panel ---
         render_monitoring_panel()
         
         st.divider()
         
-        # Turning signal history
+        # --- Turning signal history ---
         render_turning_history()
         
-        # Stock detail modal (if active)
+        st.divider()
+        
+        # --- Notification settings ---
+        render_notification_settings()
+        
+        # --- Modals (rendered last, on top of content) ---
         if st.session_state.get('show_stock_detail'):
             render_stock_detail_modal()
         
-        # Stock settings modal (if active)
         if st.session_state.get('show_stock_settings'):
             render_stock_settings_modal()
+
+        if st.session_state.get('show_edit_stock'):
+            render_edit_stock_modal()
         
-        # Auto-refresh logic - only refresh data, not full page reload
+        if st.session_state.get('show_diff_modal'):
+            render_diff_modal()
+        
+        # --- Auto-refresh logic ---
         if st.session_state.get('auto_refresh', True):
             # Use a shorter delay and incremental refresh
-            time.sleep(10)  # Refresh every 10 seconds (was 5)
+            time.sleep(10)  # Refresh every 10 seconds
             st.session_state.refresh_alerts = True
+            # Update last refresh timestamp
+            st.session_state.watchlist_last_update = datetime.utcnow().strftime("%H:%M:%S")
             # Only reload watchlist data, not full rerun if possible
             watchlist_data = load_watchlist()
             if watchlist_data != st.session_state.get('watchlist_data', []):

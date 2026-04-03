@@ -1,0 +1,17 @@
+# Web UI Dependencies
+streamlit>=1.32.0
+plotly>=5.18.0
+
+# API Dependencies
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+sse-starlette>=2.0.0
+
+# Models
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Background Tasks
+celery>=5.3.0  # Optional for advanced queue
+redis>=5.0.0   # Optional for cache/queue

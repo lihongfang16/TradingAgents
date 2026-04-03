@@ -1,0 +1,4 @@
+[console_scripts]
+tradingagents = cli.main:app
+tradingagents-api = webapi.server:main
+tradingagents-web = web.app:main

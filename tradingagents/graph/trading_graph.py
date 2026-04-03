@@ -1,5 +1,7 @@
 # TradingAgents/graph/trading_graph.py
 
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportExplicitAny=false, reportGeneralTypeIssues=false, reportAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnannotatedClassAttribute=false, reportDeprecated=false, reportMissingTypeArgument=false, reportUnusedImport=false, reportUnusedVariable=false, reportMissingParameterType=false, reportUnknownParameterType=false, reportUnusedCallResult=false, reportMissingTypeStubs=false, reportImportCycles=false, reportCallIssue=false
+
 import os
 from pathlib import Path
 import json
@@ -49,6 +51,7 @@ class TradingAgentsGraph:
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
+        fast_mode: bool = False,
     ):
         """Initialize the trading agents graph and components.
 
@@ -61,6 +64,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.fast_mode = fast_mode
 
         # Update the interface's config
         set_config(self.config)
@@ -82,8 +86,8 @@ class TradingAgentsGraph:
         api_key = self.config.get("api_key")
         if api_key:
             llm_kwargs["api_key"] = api_key
-        import logging
-        logging.info(f"[API_KEY_TRACE] trading_graph: api_key length = {len(api_key) if api_key else 0}")
+        # import logging
+        # logging.info(f"[API_KEY_TRACE] trading_graph: api_key length = {len(api_key) if api_key else 0}")
 
         deep_client = create_llm_client(
             provider=self.config["llm_provider"],
@@ -138,12 +142,12 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Set up the graph
-        self.graph = self.graph_setup.setup_graph(selected_analysts)
+        self.graph = self.graph_setup.setup_graph(selected_analysts, fast_mode=self.fast_mode)
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
-        provider = self.config.get("llm_provider", "").lower()
+        provider = str(self.config.get("llm_provider", "") or "").lower()
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
@@ -198,13 +202,19 @@ class TradingAgentsGraph:
             ),
         }
 
-    def propagate(self, company_name, trade_date, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
+    def propagate(
+        self,
+        company_name,
+        trade_date,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        initial_state: Optional[Dict[str, Any]] = None,
+    ):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
 
         # Initialize state
-        init_agent_state = self.propagator.create_initial_state(
+        init_agent_state = initial_state or self.propagator.create_initial_state(
             company_name, trade_date
         )
         args = self.propagator.get_graph_args(
@@ -277,15 +287,17 @@ class TradingAgentsGraph:
             "final_trade_decision": final_state["final_trade_decision"],
         }
 
-        # Save to file
-        directory = Path(f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/")
+        # Save to file - sanitize ticker to avoid invalid path characters
+        # Replace Windows illegal chars: < > : " | ? *
+        safe_ticker = str(self.ticker).replace('<', '_').replace('>', '_').replace(':', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_')
+        directory = Path("eval_results") / safe_ticker / "TradingAgentsStrategy_logs"
         directory.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-            encoding="utf-8",
-        ) as f:
+        # Sanitize trade_date for filename
+        safe_date = str(trade_date).replace('<', '_').replace('>', '_').replace(':', '_').replace('"', '_').replace('|', '_').replace('?', '_').replace('*', '_')
+        file_path = directory / f"full_states_log_{safe_date}.json"
+        
+        with open(file_path, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):

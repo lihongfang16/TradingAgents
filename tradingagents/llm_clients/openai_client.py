@@ -61,8 +61,8 @@ class OpenAIClient(BaseLLMClient):
             if key in self.kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
-        import logging
-        logging.info(f"[API_KEY_TRACE] openai_client: api_key in kwargs = {'api_key' in llm_kwargs}, length = {len(llm_kwargs.get('api_key', '')) if llm_kwargs.get('api_key') else 0}")
+        # import logging
+        # logging.info(f"[API_KEY_TRACE] openai_client: api_key in kwargs = {'api_key' in llm_kwargs}, length = {len(llm_kwargs.get('api_key', '')) if llm_kwargs.get('api_key') else 0}")
 
         if self.provider == "openai" and not self.base_url:
             llm_kwargs["use_responses_api"] = True

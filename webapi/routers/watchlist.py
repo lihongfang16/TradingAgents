@@ -1,23 +1,20 @@
 """
 Watchlist Router for TradingAgents API
 """
+
+# pyright: reportGeneralTypeIssues=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportImportCycles=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportCallInDefaultInitializer=false, reportUnusedCallResult=false, reportDeprecated=false, reportUnusedFunction=false, reportUnannotatedClassAttribute=false, reportUnusedParameter=false
 import sys
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
+import asyncio
 
 from webapi.config.database import get_db
 from webapi.models.database import Watchlist, WatchlistAnalysis, WatchlistConfig
-from webapi.models.analysis import (
-    AnalysisRequest,
-    StockExchange,
-    AnalysisHistoryResponse,
-    AnalysisHistoryItem,
-    SignalType,
-)
-import asyncio
+from webapi.models.analysis import AnalysisRequest, AnalysisResponse, StockExchange, AnalysisHistoryResponse, AnalysisHistoryItem
 
 # Lazy import analysis_service to avoid slow startup
 def get_analysis_service():
@@ -30,100 +27,70 @@ def get_scheduler_service():
     return scheduler_service
 
 
+def _normalize_analysis_signal(raw_signal: Any) -> tuple[Optional[str], Optional[float]]:
+    """Normalize runner signal payload into persisted signal/confidence values."""
+    confidence_value: Optional[float] = None
+    signal_value: Optional[str] = None
+
+    if isinstance(raw_signal, dict):
+        signal_value = raw_signal.get("decision") or raw_signal.get("signal")
+        confidence = raw_signal.get("confidence")
+        if confidence is not None:
+            confidence_value = float(confidence)
+    elif isinstance(raw_signal, str):
+        normalized = raw_signal.upper().strip()
+        words = normalized.split()
+        if words:
+            last_word = words[-1].rstrip(".。")
+            signal_map = {
+                'BUY': 'BUY',
+                'OVERWEIGHT': 'OVERWEIGHT',
+                'HOLD': 'HOLD',
+                'UNDERWEIGHT': 'UNDERWEIGHT',
+                'SELL': 'SELL',
+                '买入': 'BUY',
+                '增持': 'OVERWEIGHT',
+                '持有': 'HOLD',
+                '减持': 'UNDERWEIGHT',
+                '卖出': 'SELL',
+            }
+            signal_value = signal_map.get(last_word, last_word)
+
+    return signal_value, confidence_value
+
+
+def _normalize_risk_level(result: Dict[str, Any]) -> Optional[str]:
+    """Normalize risk level from analysis result."""
+    risk_level = result.get("risk_level")
+    if not risk_level and isinstance(result.get("result"), dict):
+        risk_level = result["result"].get("risk_level")
+    if risk_level is None:
+        return None
+
+    normalized = str(risk_level).strip().lower()
+    return normalized if normalized in {"low", "medium", "high"} else None
+
+
 def create_analysis_complete_callback(watchlist_analysis_id: int):
     """Create callback to update WatchlistAnalysis and Watchlist when analysis completes."""
     def callback(task_id: str, result: Dict[str, Any]):
-        from webapi.config.database import SessionLocal
-        db = SessionLocal()
         try:
-            analysis = db.query(WatchlistAnalysis).filter(
-                WatchlistAnalysis.id == watchlist_analysis_id
-            ).first()
-            if analysis:
-                analysis.completed_at = datetime.utcnow()
-                
-                # Extract signal and confidence for later use
-                signal_value = "UNKNOWN"
-                confidence_value = 0.0
-                
-                if result.get("status") == "error":
-                    analysis.error_message = result.get("error", "Analysis failed")
-                else:
-                    # Extract signal
-                    signal = result.get("signal", "")
-                    if isinstance(signal, dict):
-                        signal_value = signal.get("decision", "UNKNOWN")
-                        confidence_value = signal.get("confidence", 0) or 0.0
-                        analysis.signal = signal_value
-                        analysis.confidence = confidence_value
-                    elif isinstance(signal, str):
-                        # Normalize signal: uppercase, strip whitespace, extract last word
-                        normalized = signal.upper().strip()
-                        # Extract the last word if it contains spaces (e.g., "Decision: BUY" -> "BUY")
-                        words = normalized.split()
-                        if words:
-                            last_word = words[-1]
-                            # Map common variations to standard 5-tier signals
-                            signal_map = {
-                                'BUY': 'BUY',
-                                'OVERWEIGHT': 'OVERWEIGHT',
-                                'HOLD': 'HOLD',
-                                'UNDERWEIGHT': 'UNDERWEIGHT',
-                                'SELL': 'SELL',
-                                # Handle common misspellings/variations with trailing dots
-                                'BUY.': 'BUY',
-                                'OVERWEIGHT.': 'OVERWEIGHT',
-                                'HOLD.': 'HOLD',
-                                'UNDERWEIGHT.': 'UNDERWEIGHT',
-                                'SELL.': 'SELL',
-                                # Chinese translations
-                                '买入': 'BUY',
-                                '增持': 'OVERWEIGHT',
-                                '持有': 'HOLD',
-                                '减持': 'UNDERWEIGHT',
-                                '卖出': 'SELL',
-                            }
-                            signal_value = signal_map.get(last_word, last_word)
-                        else:
-                            signal_value = "UNKNOWN"
-                        analysis.signal = signal_value
-                        # Confidence not available from signal processor - store None
-                        # Don't fabricate confidence as it misleads users
-                        analysis.confidence = None
-                    
-                    # Set price from result or fallback to watchlist last_price
-                    analysis.price = result.get("price")
-                    if not analysis.price:
-                        watchlist = db.query(Watchlist).filter(
-                            Watchlist.id == analysis.watchlist_id
-                        ).first()
-                        if watchlist and watchlist.last_price:
-                            analysis.price = float(watchlist.last_price)
-                    
-                    # Update confidence_value for watchlist update (None if not available)
-                    confidence_value = analysis.confidence
-                
-                db.commit()
-                
-                # Also update Watchlist current state for UI display
-                watchlist = db.query(Watchlist).filter(
-                    Watchlist.id == analysis.watchlist_id
-                ).first()
-                if watchlist:
-                    watchlist.last_analysis_at = datetime.utcnow()
-                    watchlist.last_signal = signal_value
-                    watchlist.last_confidence = str(confidence_value)
-                    db.commit()
-                    
+            from webapi.services.scheduler_service import process_watchlist_analysis_completion
+
+            enriched_result = dict(result or {})
+            enriched_result.setdefault("task_id", task_id)
+            process_watchlist_analysis_completion(watchlist_analysis_id, enriched_result)
         except Exception as e:
-            db.rollback()
             print(f"[CALLBACK ERROR] {e}", file=sys.stderr)
-        finally:
-            db.close()
     return callback
 
 
 router = APIRouter(prefix="/api/v1/watchlist", tags=["watchlist"])
+
+
+# NOTE: _result_to_response is defined after WatchlistAnalysisResponse below
+# to avoid forward-reference NameError at module load time.
+
 
 # ============================================================================
 # Pydantic Models
@@ -140,6 +107,7 @@ class WatchlistCreate(BaseModel):
 class WatchlistUpdate(BaseModel):
     """Request model for updating a watchlist entry."""
     name: Optional[str] = None
+    exchange: Optional[str] = None
     is_active: Optional[bool] = None
     turning_detection_enabled: Optional[bool] = None
     confidence_jump_threshold: Optional[float] = None
@@ -190,6 +158,61 @@ class WatchlistAnalysisResponse(BaseModel):
         from_attributes = True
 
 
+class WatchlistAnalysisHistoryResponse(BaseModel):
+    """History item for watchlist signal overlay."""
+
+    timestamp: datetime
+    signal: Optional[str] = None
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    price: Optional[float] = None
+    error_message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+def _result_to_response(result: Dict[str, Any], watchlist_id: int) -> "WatchlistAnalysisResponse":
+    """Convert incremental analysis result dict to WatchlistAnalysisResponse.
+
+    Args:
+        result: Result dict from IncrementalAnalysisService.run_incremental()
+        watchlist_id: ID of the watchlist item
+
+    Returns:
+        WatchlistAnalysisResponse populated from result
+    """
+    inner = result.get("result", {})
+    signal = inner.get("signal", "")
+    if isinstance(signal, dict):
+        signal = signal.get("decision", signal.get("signal", ""))
+    if isinstance(signal, str):
+        signal = signal.upper().strip().split()[-1] if signal.strip() else "UNKNOWN"
+
+    confidence = inner.get("confidence")
+    if confidence is not None:
+        confidence = float(confidence)
+
+    risk_level = inner.get("risk_level")
+
+    return WatchlistAnalysisResponse(
+        id=0,  # Will be set by database
+        watchlist_id=watchlist_id,
+        analysis_id=result.get("task_id"),
+        analysis_type="incremental",
+        triggered_by="manual",
+        created_at=datetime.utcnow().isoformat(),
+        completed_at=datetime.utcnow().isoformat(),
+        signal=signal,
+        confidence=confidence,
+        risk_level=risk_level,
+        is_turning_point=False,
+        turning_reason=None,
+        importance_score=None,
+        alert_sent=False,
+        alert_sent_at=None,
+    )
+
+
 class TurningDetectionRequest(BaseModel):
     """Request model for turning point detection."""
     current_result: Dict[str, Any]
@@ -209,6 +232,7 @@ class SchedulerStatusResponse(BaseModel):
     is_running: bool
     active_jobs: int
     next_scheduled: Optional[str] = None
+    job_ids: List[str] = Field(default_factory=list)
 
 
 class MonitoringStateResponse(BaseModel):
@@ -222,6 +246,11 @@ class MonitoringStateUpdate(BaseModel):
     """Request model for updating global watchlist monitoring state."""
     is_active: Optional[bool] = None
     interval_minutes: Optional[int] = None
+
+
+class IncrementalAnalyzeRequest(BaseModel):
+    """Request model for incremental analysis."""
+    force_refresh_analysts: Optional[List[str]] = None  # Optional manual override
 
 
 # ============================================================================
@@ -245,57 +274,13 @@ def detect_turning_point(
     Returns:
         TurningDetectionResponse with detection results
     """
-    config = config or {}
-    confidence_threshold = config.get('confidence_jump', 0.15)
+    from webapi.services.scheduler_service import detect_turning_point as scheduler_detect_turning_point
 
-    current_signal = current_result.get('signal', 'UNKNOWN')
-    previous_signal = previous_result.get('signal', 'UNKNOWN')
-
-    # Handle nested signal structure
-    if isinstance(current_signal, dict):
-        current_signal = current_signal.get('decision', current_signal.get('signal', 'UNKNOWN'))
-    if isinstance(previous_signal, dict):
-        previous_signal = previous_signal.get('decision', previous_signal.get('signal', 'UNKNOWN'))
-
-    current_conf = current_result.get('confidence', 0)
-    previous_conf = previous_result.get('confidence', 0)
-
-    current_risk = current_result.get('risk_level', 'medium')
-    previous_risk = previous_result.get('risk_level', 'medium')
-
-    turning_signals: List[str] = []
-    importance = 0.0
-
-    # 1. Signal change detection
-    if current_signal != previous_signal and current_signal in ['BUY', 'SELL']:
-        if previous_signal in ['SELL', 'BUY'] or (previous_signal == 'HOLD' and current_conf > 0.75):
-            turning_signals.append(f"信号转变: {previous_signal} → {current_signal}")
-            importance += 0.9
-
-    # 2. Confidence jump detection
-    conf_jump = current_conf - previous_conf
-    if conf_jump >= confidence_threshold and current_conf > 0.8:
-        turning_signals.append(f"置信度突破: {previous_conf:.0%} → {current_conf:.0%}")
-        importance += 0.6
-
-    # 3. Risk level change detection
-    risk_levels = {'low': 1, 'medium': 2, 'high': 3}
-    if risk_levels.get(current_risk, 2) != risk_levels.get(previous_risk, 2):
-        if risk_levels.get(current_risk, 2) > risk_levels.get(previous_risk, 2):
-            turning_signals.append(f"风险上升: {previous_risk} → {current_risk}")
-            importance += 0.4
-        else:
-            turning_signals.append(f"风险下降: {previous_risk} → {current_risk}")
-            importance += 0.3
-
-    # 4. Emergency signal detection
-    market_alert = current_result.get('market_alert', '')
-    if market_alert and '异常' in str(market_alert):
-        turning_signals.append(f"市场警报: {market_alert}")
-        importance += 0.95
-
-    is_turning = importance >= 0.5 or len(turning_signals) >= 2
-    reason = " | ".join(turning_signals) if turning_signals else "无显著变化"
+    is_turning, reason, importance = scheduler_detect_turning_point(
+        current_result=current_result,
+        previous_result=previous_result,
+        config=config,
+    )
 
     return TurningDetectionResponse(
         is_turning=is_turning,
@@ -360,15 +345,19 @@ def _analysis_to_response(a: WatchlistAnalysis) -> WatchlistAnalysisResponse:
 @router.post("/", response_model=WatchlistResponse, status_code=201)
 async def create_watchlist(request: WatchlistCreate, db: Session = Depends(get_db)):
     """Add a new stock to the watchlist."""
+    normalized_symbol = request.symbol.strip().upper()
+    normalized_name = request.name.strip() if request.name else None
+    normalized_exchange = request.exchange.strip().upper() if request.exchange else None
+
     # Check if symbol already exists
-    existing = db.query(Watchlist).filter(Watchlist.symbol == request.symbol).first()
+    existing = db.query(Watchlist).filter(Watchlist.symbol == normalized_symbol).first()
     if existing:
-        raise HTTPException(status_code=409, detail=f"Symbol {request.symbol} already in watchlist")
+        raise HTTPException(status_code=409, detail=f"Symbol {normalized_symbol} already in watchlist")
 
     watchlist = Watchlist(
-        symbol=request.symbol,
-        name=request.name,
-        exchange=request.exchange,
+        symbol=normalized_symbol,
+        name=normalized_name,
+        exchange=normalized_exchange,
         added_at=datetime.utcnow(),
         is_active='Y',
         turning_detection_enabled='Y',
@@ -549,6 +538,7 @@ async def get_scheduler_status():
         is_running=scheduler_service.is_running,
         active_jobs=len(jobs),
         next_scheduled=next_scheduled,
+        job_ids=[str(job.get("id")) for job in jobs if job.get("id")],
     )
 
 
@@ -559,45 +549,11 @@ async def trigger_scheduler_job(job_id: str, db: Session = Depends(get_db)):
 
     In production, this would invoke the actual scheduler job handler.
     """
-    # For now, trigger analysis for all active high-frequency watchlist items
-    high_freq_items = db.query(Watchlist).filter(
-        Watchlist.is_active == 'Y',
-        Watchlist.is_high_frequency == 'Y',
-    ).all()
-
-    results = []
-    for item in high_freq_items:
-        request = AnalysisRequest(
-            symbol=item.symbol,
-            exchange=StockExchange.CN,
-        )
-        task = get_analysis_service().create_task(request)
-
-        watchlist_analysis = WatchlistAnalysis(
-            watchlist_id=item.id,
-            analysis_id=task.task_id,
-            analysis_type='scheduled',
-            triggered_by='scheduler',
-            created_at=datetime.utcnow(),
-        )
-        db.add(watchlist_analysis)
-        db.commit()
-
-        asyncio.create_task(
-            get_analysis_service().run_analysis(task.task_id, request)
-        )
-
-        results.append({
-            "symbol": item.symbol,
-            "task_id": task.task_id,
-            "watchlist_analysis_id": watchlist_analysis.id,
-        })
-
-    return {
-        "job_id": job_id,
-        "triggered": len(results),
-        "results": results,
-    }
+    _ = db
+    result = get_scheduler_service().trigger_job(job_id)
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"Scheduler job not found: {job_id}")
+    return result
 
 
 # ============================================================================
@@ -626,7 +582,9 @@ async def update_watchlist(
         raise HTTPException(status_code=404, detail="Watchlist entry not found")
 
     if request.name is not None:
-        watchlist.name = request.name
+        watchlist.name = request.name.strip() or None
+    if request.exchange is not None:
+        watchlist.exchange = request.exchange.strip().upper() or None
     if request.is_active is not None:
         watchlist.is_active = 'Y' if request.is_active else 'N'
     if request.turning_detection_enabled is not None:
@@ -661,8 +619,9 @@ async def delete_watchlist(watchlist_id: int, db: Session = Depends(get_db)):
 @router.post("/analyze", response_model=Dict[str, Any])
 async def trigger_watchlist_analysis(
     symbol: Optional[str] = Query(None, description="Optional symbol filter"),
+    force_refresh: bool = Query(False, description="Bypass cache and force full recomputation"),
     db: Session = Depends(get_db),
-):
+) -> Dict[str, Any]:
     """Manually trigger analysis for all (or filtered) watchlist stocks."""
     query = db.query(Watchlist).filter(Watchlist.is_active == 'Y')
     if symbol:
@@ -678,6 +637,7 @@ async def trigger_watchlist_analysis(
         request = AnalysisRequest(
             symbol=item.symbol,
             exchange=StockExchange.CN,
+            force_refresh=force_refresh,
         )
         task = get_analysis_service().create_task(request)
 
@@ -711,11 +671,11 @@ async def trigger_watchlist_analysis(
     return {"triggered": len(results), "results": results}
 
 
-@router.post("/{watchlist_id}/quick-analyze", response_model=WatchlistAnalysisResponse, status_code=202)
+@router.post("/{watchlist_id}/quick-analyze", response_model=AnalysisResponse, status_code=202)
 async def quick_analyze(
     watchlist_id: int,
     db: Session = Depends(get_db),
-):
+) -> AnalysisResponse:
     """Trigger a quick analysis (Fast Mode) for a watchlist stock."""
     watchlist = db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
     if not watchlist:
@@ -725,9 +685,11 @@ async def quick_analyze(
     request = AnalysisRequest(
         symbol=watchlist.symbol,
         exchange=StockExchange.CN,
-        analysts=["market"],  # Quick mode: only market analyst
+        analysts=["market"],
+        is_quick=True,
     )
-    task = get_analysis_service().create_task(request)
+    analysis_service = get_analysis_service()
+    task = analysis_service.create_task(request)
 
     # Record watchlist analysis
     watchlist_analysis = WatchlistAnalysis(
@@ -744,14 +706,136 @@ async def quick_analyze(
     # Start analysis in background with callback
     watchlist_analysis_id = watchlist_analysis.id
     asyncio.create_task(
-        get_analysis_service().run_analysis(
+        analysis_service.run_analysis(
             task.task_id, 
             request,
-            on_complete=create_analysis_complete_callback(watchlist_analysis_id)
+            on_complete=create_analysis_complete_callback(watchlist_analysis_id),
+            is_quick=True,
         )
     )
 
-    return _analysis_to_response(watchlist_analysis)
+    return AnalysisResponse(
+        task_id=task.task_id,
+        status=task.status,
+        symbol=task.symbol,
+        message=f"Quick analysis queued for {watchlist.symbol}",
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        completed_at=task.completed_at,
+        result={
+            "analysis_type": "quick",
+            "watchlist_id": watchlist.id,
+            "watchlist_analysis_id": watchlist_analysis.id,
+        },
+        error=task.error,
+        logs=task.logs,
+        agents_progress=task.agents_progress,
+        current_agent=task.current_agent,
+        progress_pct=task.progress_pct,
+        elapsed_time=task.elapsed_time,
+        remaining_time=task.remaining_time,
+        llm_streams=task.llm_streams,
+    )
+
+
+@router.post("/{watchlist_id}/incremental-analyze/precheck")
+async def incremental_analyze_precheck(
+    watchlist_id: int,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Precheck endpoint for incremental analysis.
+
+    Runs change detection and returns which analysts need refresh
+    vs which can use cached results. Does NOT execute any analysis.
+    """
+    # Get watchlist
+    watchlist = db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
+    if not watchlist:
+        raise HTTPException(status_code=404, detail="Watchlist entry not found")
+
+    # Check full analysis exists today (matches IncrementalAnalysisService logic)
+    today = date.today()
+    full_today = db.query(WatchlistAnalysis).filter(
+        WatchlistAnalysis.analysis_type == 'full',
+        WatchlistAnalysis.completed_at.isnot(None),
+        WatchlistAnalysis.error_message.is_(None),
+        func.date(WatchlistAnalysis.created_at) == today,
+    ).first()
+
+    if not full_today:
+        return {
+            "error": "需要先完成今日全量分析",
+            "needs_refresh": [],
+            "cached": [],
+            "all_cached": False,
+        }
+
+    # Run change detection
+    from webapi.services.change_detection import ChangeDetector
+
+    detector = ChangeDetector()
+    last_analysis_time = full_today.completed_at
+    last_price = float(watchlist.last_price) if watchlist.last_price else None
+
+    changes = detector.auto_detect(
+        symbol=watchlist.symbol,
+        last_analysis_time=last_analysis_time,
+        last_price=last_price,
+    )
+
+    needs_refresh = [k for k, v in changes.items() if v]
+    cached = [k for k, v in changes.items() if not v]
+
+    return {
+        "needs_refresh": needs_refresh,
+        "cached": cached,
+        "all_cached": len(needs_refresh) == 0,
+    }
+
+
+@router.post("/{watchlist_id}/incremental-analyze", response_model=WatchlistAnalysisResponse)
+async def incremental_analyze(
+    watchlist_id: int,
+    request: Optional[IncrementalAnalyzeRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """Trigger an incremental analysis for a watchlist stock.
+
+    Incremental analysis re-runs only analysts whose data has changed since
+    the last full analysis, using cached results for unchanged analysts.
+    """
+    # 1. Get watchlist item from DB
+    watchlist_item = db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
+    if not watchlist_item:
+        raise HTTPException(status_code=404, detail="Watchlist entry not found")
+
+    # 2. Prepare options
+    options = {
+        "watchlist_id": watchlist_id,
+        "triggered_by": "manual",
+    }
+    if request and request.force_refresh_analysts:
+        options["force_refresh_analysts"] = request.force_refresh_analysts
+
+    # 3. Call IncrementalAnalysisService.run_incremental()
+    from webapi.services.incremental_analysis_service import IncrementalAnalysisService
+    service = IncrementalAnalysisService(db)
+    result = service.run_incremental(
+        symbol=watchlist_item.symbol,
+        analysis_date=date.today().isoformat(),
+        options=options,
+    )
+
+    # 4. Handle return values
+    if "error" in result:
+        error = result["error"]
+        status_code = result.get("status", 400)
+        if status_code == 409:
+            raise HTTPException(status_code=409, detail=error)
+        raise HTTPException(status_code=400, detail=error)
+
+    # 5. Return 200 with WatchlistAnalysisResponse
+    return _result_to_response(result, watchlist_id)
 
 
 # ============================================================================
@@ -763,49 +847,35 @@ async def quick_analyze(
 async def get_analysis_history(
     watchlist_id: int,
     limit: int = Query(50, ge=1, le=100, description="Number of records to return"),
-    offset: int = Query(0, ge=0, description="Offset for pagination"),
     db: Session = Depends(get_db),
 ):
     """Get analysis history for a watchlist stock (for K-line overlay)."""
-    # Check if watchlist exists
     watchlist = db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
     if not watchlist:
         raise HTTPException(status_code=404, detail="Watchlist entry not found")
 
-    # Query analysis history - filter to only include records with valid signals
-    # This ensures total/has_more are accurate for the actual returned items
-    valid_signals = [s.value for s in SignalType]
-    query = db.query(WatchlistAnalysis).filter(
-        WatchlistAnalysis.watchlist_id == watchlist_id,
-        WatchlistAnalysis.completed_at.isnot(None),  # Only completed analyses
-        WatchlistAnalysis.signal.in_(valid_signals)  # Only valid signals
-    ).order_by(WatchlistAnalysis.created_at.desc())
+    analyses = WatchlistAnalysis.get_analysis_history(watchlist_id, limit=limit, db=db)
 
-    total = query.count()
-    analyses = query.offset(offset).limit(limit).all()
-
-    # Convert to response items
-    items = []
+    items: List[AnalysisHistoryItem] = []
     for analysis in analyses:
-        # Signal is already validated by the query filter
-        signal_enum = SignalType(analysis.signal)
-        
-        # Use completed_at for timestamp (when price was captured)
-        # Only include confidence if it was actually produced by the analysis
-        confidence_val = float(analysis.confidence) if analysis.confidence else None
-        
         items.append(AnalysisHistoryItem(
             timestamp=analysis.completed_at or analysis.created_at,
-            signal=signal_enum,
-            confidence=confidence_val,
-            price=float(analysis.price) if analysis.price else None,
+            signal=analysis.signal,
+            confidence=float(analysis.confidence) if analysis.confidence else None,
+            price=analysis.price,
             error_message=analysis.error_message,
         ))
+
+    # Count total for pagination info
+    total_count = db.query(WatchlistAnalysis).filter(
+        WatchlistAnalysis.watchlist_id == watchlist_id,
+        WatchlistAnalysis.completed_at.isnot(None),
+    ).count()
 
     return AnalysisHistoryResponse(
         watchlist_id=watchlist_id,
         symbol=watchlist.symbol,
         items=items,
-        total=total,
-        has_more=(offset + len(items)) < total,
+        total=total_count,
+        has_more=total_count > limit,
     )

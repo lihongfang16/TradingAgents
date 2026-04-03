@@ -1,0 +1,80 @@
+{
+  "test_id": "F2",
+  "test_name": "End-to-End UI Test - Watchlist Three-Button Analysis",
+  "executed_at": "2026-04-02T11:00:00Z",
+  "environment": {
+    "web_url": "http://localhost:8501",
+    "api_url": "http://localhost:8000",
+    "browser": "Chromium (Playwright headless + Chrome DevTools)",
+    "streamlit_version": "latest",
+    "watchlist_stocks": ["002172 澳洋健康", "601233 桐昆股份"]
+  },
+  "summary": {
+    "total_scenarios": 5,
+    "passed": 2,
+    "failed": 1,
+    "blocked": 2,
+    "details": "2 scenarios passed, 1 failed due to data model bug, 2 blocked by backend bugs"
+  },
+  "scenarios": [
+    {
+      "id": "S1",
+      "name": "Three Buttons Visible Per Stock",
+      "status": "PASS",
+      "evidence": ".sisyphus/evidence/f2-ui-test/s1-three-buttons-visible.png",
+      "details": "Verified 6 analysis buttons visible (2 stocks x 3 buttons each): quanliang, zengliang, chayi. Playwright test confirmed full_count=4, incr_count=4, diff_count=4 (duplicates from Streamlit re-render). DOM assertions passed."
+    },
+    {
+      "id": "S2",
+      "name": "Button State Logic Correctness",
+      "status": "FAIL",
+      "evidence": ".sisyphus/evidence/f2-ui-test/s2-button-state-logic.png",
+      "details": "Expected: full=enabled (no running tasks), incremental=disabled (no full analysis today), diff=enabled (2+ completed analyses). Actual: full=enabled, incremental=disabled, diff=enabled. Incremental correctly disabled, but root cause is WRONG: _has_full_analysis_today() always returns False because AnalysisTask model lacks analysis_type column (see BUG-1)."
+    },
+    {
+      "id": "S3",
+      "name": "Click Full Analysis Triggers Analysis",
+      "status": "PASS",
+      "evidence": ".sisyphus/evidence/f2-ui-test/s3-full-analysis-triggered.png",
+      "details": "Clicked full button for 002172. UI responded with: (1) toast message confirming analysis started, (2) full button became disabled, (3) incremental and diff buttons became disabled. State transitions work correctly: enabled to disabled on click."
+    },
+    {
+      "id": "S4",
+      "name": "Incremental Analysis Flow",
+      "status": "BLOCKED",
+      "evidence": null,
+      "details": "BLOCKED by BUG-1: _has_full_analysis_today() in watchlist_manager.py checks task.get('analysis_type') == 'full', but AnalysisTask model (database.py) does NOT have analysis_type column. WatchlistAnalysis model (separate table) has it, but /api/v1/analysis/ endpoint queries AnalysisTask. Result: incremental button is ALWAYS disabled, precheck dialog can never be reached."
+    },
+    {
+      "id": "S5",
+      "name": "Diff Modal Display",
+      "status": "BLOCKED",
+      "evidence": ".sisyphus/evidence/f2-ui-test/s5-diff-error-405.png",
+      "details": "BLOCKED by BUG-2: FastAPI route ordering issue. POST /api/v1/analysis/diff-report returns 405 Method Not Allowed. Root cause: GET /{task_id} route (line 51) is defined BEFORE POST /diff-report (line 85) in analysis.py. FastAPI matches 'diff-report' as {task_id} parameter, and since {task_id} only has GET/DELETE methods, POST returns 405."
+    }
+  ],
+  "bugs_found": [
+    {
+      "id": "BUG-1",
+      "severity": "HIGH",
+      "title": "analysis_type column missing from AnalysisTask model",
+      "description": "AnalysisTask ORM model (webapi/models/database.py) does not have analysis_type column, but watchlist_manager.py _has_full_analysis_today() checks task.get('analysis_type') == 'full'. The WatchlistAnalysis model (line 349) has analysis_type, but it is a separate table not queried by the /api/v1/analysis/ endpoint.",
+      "impact": "Incremental button is permanently disabled. Users cannot run incremental analysis from the watchlist UI.",
+      "files": ["webapi/models/database.py", "web/components/watchlist_manager.py"]
+    },
+    {
+      "id": "BUG-2",
+      "severity": "HIGH",
+      "title": "FastAPI route ordering prevents POST /diff-report",
+      "description": "In webapi/routers/analysis.py, GET /{task_id} (line 51) is defined before POST /diff-report (line 85). FastAPI matches 'diff-report' as the {task_id} path parameter. Since {task_id} only accepts GET and DELETE, POST requests to /diff-report return 405.",
+      "impact": "Diff button click triggers HTTP 405 error. Users cannot view analysis diff comparisons.",
+      "files": ["webapi/routers/analysis.py"]
+    }
+  ],
+  "screenshot_paths": [
+    ".sisyphus/evidence/f2-ui-test/s1-three-buttons-visible.png",
+    ".sisyphus/evidence/f2-ui-test/s2-button-state-logic.png",
+    ".sisyphus/evidence/f2-ui-test/s3-full-analysis-triggered.png",
+    ".sisyphus/evidence/f2-ui-test/s5-diff-error-405.png"
+  ]
+}

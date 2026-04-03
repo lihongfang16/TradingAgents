@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import models
-from webapi.models.database import Base, AnalysisTask, Watchlist, WatchlistAnalysis, AnalysisBatch, WatchlistConfig
+from webapi.models.database import Base, AnalysisTask, Watchlist, WatchlistAnalysis, AnalysisBatch, WatchlistConfig, AnalystReportCache
 
 # Get DATABASE_URL from environment (fail fast if not set)
 DATABASE_URL = os.getenv("DATABASE_URL")

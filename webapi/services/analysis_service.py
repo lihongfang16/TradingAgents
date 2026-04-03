@@ -6,14 +6,18 @@ and progress tracking for the FastAPI layer.
 Storage is backed by PostgreSQL via SQLAlchemy ORM (AnalysisTask model).
 """
 
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportGeneralTypeIssues=false, reportMissingTypeArgument=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportDeprecated=false, reportUnannotatedClassAttribute=false
+
 import asyncio
 import logging
 import os
-import traceback
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
+
+# Initialize logger early for module-level logging
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -23,16 +27,11 @@ for env_path in ['.env', '../.env', '../../.env', 'D:/1.MyProjects/Other/trading
     if os.path.exists(env_path):
         load_dotenv(env_path)
         env_loaded = True
-        print(f"[ENV] Loaded .env from: {env_path}", flush=True)
         break
 if not env_loaded:
     load_dotenv()  # Fallback to default behavior
-    print("[ENV] Using default load_dotenv()", flush=True)
 
-# Debug: check if key is loaded
-print(f"[ENV] OPENAI_API_KEY present: {bool(os.getenv('OPENAI_API_KEY'))}", flush=True)
-
-from tradingagents.core.analysis_runner import AnalysisRunner
+# Pre-import these modules to avoid import issues in threads on Windows
 from webapi.models.analysis import (
     AnalysisRequest,
     AnalysisResponse,
@@ -42,11 +41,7 @@ from webapi.models.analysis import (
 )
 from webapi.models.database import AnalysisTask, AnalysisBatch
 from webapi.config.database import SessionLocal
-
-# Import local history persistence (no API dependencies)
-from webapi.services.history_persistence import add_to_local_history
-
-logger = logging.getLogger(__name__)
+from webapi.services.queue_service import AnalysisQueueService
 
 
 def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
@@ -73,17 +68,22 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
             ).total_seconds()
         )
 
-        # Estimate remaining time based on progress
-        progress_pct = result_data.get("progress_pct", 0) if isinstance(result_data, dict) else 0
-        if progress_pct > 0 and progress_pct < 100:
-            estimated_total = int(elapsed_seconds * 100 / progress_pct)
-            remaining_seconds = max(0, estimated_total - elapsed_seconds)
-            remaining_time = remaining_seconds
-        else:
+        stored_remaining_time = None
+        if isinstance(result_data, dict):
+            stored_remaining_time = result_data.get("remaining_time")
+
+        if task.status in (AnalysisStatus.COMPLETED.value, AnalysisStatus.FAILED.value, AnalysisStatus.CANCELLED.value):
             remaining_time = 0
+        elif stored_remaining_time is None:
+            remaining_time = None
+        else:
+            try:
+                remaining_time = max(0, int(stored_remaining_time))
+            except (TypeError, ValueError):
+                remaining_time = None
     else:
         elapsed_seconds = 0
-        remaining_time = 0
+        remaining_time = None
 
     # Keep elapsed/remaining time available in result_data for UI paths
     # that read result_data.get("elapsed_time") / result_data.get("remaining_time").
@@ -91,6 +91,11 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
         result_data = {}
     result_data["elapsed_time"] = elapsed_seconds
     result_data["remaining_time"] = remaining_time
+    result_data["is_progress_indeterminate"] = bool(
+        task.status in (AnalysisStatus.PENDING.value, AnalysisStatus.RUNNING.value)
+        and remaining_time is None
+        and (task.progress_pct or 0) < 100
+    )
 
     # Return AnalysisResponse with time fields populated
     return AnalysisResponse(
@@ -109,6 +114,7 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
         progress_pct=task.progress_pct,
         elapsed_time=elapsed_seconds,
         remaining_time=remaining_time,
+        llm_streams=task.llm_streams,
     )
 
 
@@ -135,22 +141,39 @@ class AnalysisService:
     for the FastAPI web layer. Task state is persisted to PostgreSQL.
     """
 
-    def __init__(self, max_workers: int = 4):
+    _instance = None
+
+    def __new__(cls):
+        """Keep a single shared service instance for concurrency limits."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
         """
         Initialize the AnalysisService.
-
-        Args:
-            max_workers: Maximum number of concurrent analysis tasks (default: 4)
         """
+        if self._initialized:
+            return
+
+        self._initialized = True
         self._batch_tasks: Dict[str, BatchAnalysisResponse] = {}
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._progress_callbacks: Dict[str, Callable] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self.queue_service = AnalysisQueueService()
+
+        logger.info("AnalysisService initialized with PostgreSQL queue backend")
 
     # ------------------------------------------------------------------
     # CRUD operations backed by PostgreSQL
     # ------------------------------------------------------------------
 
-    def create_task(self, request: AnalysisRequest) -> AnalysisResponse:
+    def create_task(
+        self,
+        request: AnalysisRequest,
+        task_id: Optional[str] = None,
+    ) -> AnalysisResponse:
         """
         Create a new analysis task and persist it to the database.
 
@@ -164,7 +187,7 @@ class AnalysisService:
         try:
             now = datetime.utcnow()
             task = AnalysisTask(
-                task_id=str(uuid.uuid4()),
+                task_id=task_id or str(uuid.uuid4()),
                 symbol=request.symbol,
                 status=AnalysisStatus.PENDING.value,
                 created_at=now,
@@ -298,12 +321,15 @@ class AnalysisService:
         else:
             elapsed = 0
 
-        # Estimate total time based on analysts count (rough estimate)
-        analysts = task_resp.result.get("analysts", []) if task_resp.result else []
-        analyst_count = len(analysts) if analysts else 1
-        estimated_total = 60 * analyst_count + 60
+        progress_pct = task_resp.progress_pct or 0
+        remaining_raw = task_resp.remaining_time
 
-        # Calculate progress based on status
+        try:
+            remaining = round(float(remaining_raw), 1) if remaining_raw is not None else None
+        except (TypeError, ValueError):
+            remaining = None
+
+        # Calculate progress based on tracked status
         status = task_resp.status
         if status == AnalysisStatus.COMPLETED:
             progress = 100
@@ -312,228 +338,244 @@ class AnalysisService:
             progress = 100
             remaining = 0
         elif status == AnalysisStatus.PENDING:
-            progress = 0
-            remaining = estimated_total
+            progress = progress_pct
         else:  # RUNNING
-            if elapsed < 30:
-                progress = min(10, (elapsed / 30) * 10)
-            elif elapsed < 60:
-                progress = 10 + min(20, ((elapsed - 30) / 30) * 20)
-            elif elapsed < 120:
-                progress = 30 + min(25, ((elapsed - 60) / 60) * 25)
-            else:
-                progress = min(55, 55 + ((elapsed - 120) / 120) * 20)
-            remaining = max(0, estimated_total - elapsed)
+            progress = progress_pct
 
         return {
             "task_id": task_id,
             "status": status.value if hasattr(status, 'value') else str(status),
             "progress": round(progress, 1),
             "elapsed": round(elapsed, 1),
-            "remaining": round(remaining, 1),
+            "remaining": remaining,
             "message": task_resp.message or "",
+            "current_agent": task_resp.current_agent or "",
+            "is_progress_indeterminate": bool(
+                status in {AnalysisStatus.PENDING, AnalysisStatus.RUNNING} and remaining is None and progress < 100
+            ),
         }
 
     # ------------------------------------------------------------------
     # Analysis execution
     # ------------------------------------------------------------------
 
-    async def run_analysis(
+    def _ensure_task_record(self, task_id: str, request: AnalysisRequest) -> AnalysisResponse:
+        """Get or create a persisted task row using the provided task ID."""
+        task_resp = self.get_task(task_id)
+        if task_resp is not None:
+            return task_resp
+        return self.create_task(request, task_id=task_id)
+
+    def _update_task_status(
         self,
         task_id: str,
-        request: AnalysisRequest,
-        on_complete: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    ) -> AnalysisResponse:
-        """
-        Run analysis for a task asynchronously using thread pool executor.
-
-        Args:
-            task_id: UUID of the task to run
-            request: AnalysisRequest containing analysis parameters
-            on_complete: Optional callback called when analysis finishes (receives task_id, result dict)
-
-        Returns:
-            AnalysisResponse with completed analysis result
-        """
-        # Get or create task from DB
-        task_resp = self.get_task(task_id)
-        if task_resp is None:
-            task_resp = self.create_task(request)
-            task_id = task_resp.task_id
-
-        # Update status to RUNNING in DB
-        now = datetime.utcnow()
+        status: str,
+        *,
+        message: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Update task status with optional message and error fields."""
         db = SessionLocal()
         try:
-            db_task = db.query(AnalysisTask).filter(
-                AnalysisTask.task_id == task_id
-            ).first()
-            if db_task:
-                db_task.status = AnalysisStatus.RUNNING.value
-                db_task.updated_at = now
-                db_task.message = f"Running analysis for {request.symbol}"
-                db.commit()
+            task = db.query(AnalysisTask).filter(AnalysisTask.task_id == task_id).first()
+            if task is None:
+                return
+
+            now = datetime.utcnow()
+            task.status = status
+            task.updated_at = now
+
+            if status in {
+                AnalysisStatus.COMPLETED.value,
+                AnalysisStatus.FAILED.value,
+                AnalysisStatus.CANCELLED.value,
+            }:
+                task.completed_at = task.completed_at or now
+
+            if message is not None:
+                task.message = message
+            if error is not None:
+                task.error = error
+
+            db.commit()
         except Exception:
             db.rollback()
             raise
         finally:
             db.close()
 
-        # Re-read to get fresh state
-        task_resp = self.get_task(task_id)
+    def _track_background_task(self, task: asyncio.Task) -> None:
+        """Keep background tasks referenced until completion."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
-        timeout_raw = os.getenv("ANALYSIS_TIMEOUT", "600")
+    def _invoke_on_complete(
+        self,
+        task_id: str,
+        on_complete: Optional[Callable[[str, Dict[str, Any]], None]],
+    ) -> None:
+        """Invoke completion callback with the latest task result."""
+        if not on_complete:
+            return
+
+        final_task = self.get_task(task_id)
+        result = final_task.result if final_task and final_task.result else {}
+        on_complete(task_id, result)
+
+    def _prepare_task_for_queue(
+        self,
+        task_id: str,
+        request: AnalysisRequest,
+        *,
+        priority: int,
+    ) -> AnalysisResponse:
+        """Ensure the task exists and is ready for worker pickup."""
+        task_resp = self._ensure_task_record(task_id, request)
+        self._update_task_status(
+            task_id,
+            AnalysisStatus.PENDING.value,
+            message=f"Analysis queued for {request.symbol}",
+            error=None,
+        )
+
+        self.queue_service.enqueue(
+            task_id,
+            request.model_dump(mode="json"),
+            priority=priority,
+        )
+
+        refreshed_task = self.get_task(task_id)
+        return refreshed_task or task_resp
+
+    def _apply_request_mode(self, request: AnalysisRequest, *, is_quick: Optional[bool] = None) -> AnalysisRequest:
+        """Clone request with execution-mode overrides."""
+        if is_quick is None:
+            return request
+        return request.model_copy(update={"is_quick": is_quick})
+
+    def _wait_for_task_completion(self, task_id: str, timeout: int) -> AnalysisResponse:
+        """Block until a queued task reaches a terminal state."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            task = self.get_task(task_id)
+            if task is None:
+                raise ValueError(f"Task {task_id} not found")
+            if task.status in {
+                AnalysisStatus.COMPLETED,
+                AnalysisStatus.FAILED,
+                AnalysisStatus.CANCELLED,
+            }:
+                return task
+            time.sleep(0.5)
+
+        raise TimeoutError(f"Analysis {task_id} did not complete within {timeout}s")
+
+    async def _await_completion_callback(
+        self,
+        task_id: str,
+        on_complete: Callable[[str, Dict[str, Any]], None],
+    ) -> None:
+        """Wait asynchronously for task completion before firing callbacks."""
         try:
-            timeout_seconds = max(1, int(timeout_raw))
-        except (TypeError, ValueError):
-            timeout_seconds = 600
-            logger.warning(
-                "Invalid ANALYSIS_TIMEOUT value '%s', falling back to %s seconds",
-                timeout_raw,
-                timeout_seconds,
+            await asyncio.to_thread(self._wait_for_task_completion, task_id, 600)
+        except Exception:
+            logger.exception("Completion callback wait failed for %s", task_id)
+        finally:
+            self._invoke_on_complete(task_id, on_complete)
+
+    async def run_analysis(
+        self,
+        task_id: str,
+        request: AnalysisRequest,
+        on_complete: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        priority: int = 0,
+        blocking: bool = False,
+        is_quick: Optional[bool] = None,
+    ) -> AnalysisResponse:
+        """
+        Queue analysis for worker-based subprocess execution.
+
+        Args:
+            task_id: UUID of the task to run
+            request: AnalysisRequest containing analysis parameters
+            on_complete: Optional callback called when analysis finishes
+            priority: Queue priority (higher values run earlier)
+            blocking: True waits until a worker finishes the task
+
+        Returns:
+            AnalysisResponse with task state
+        """
+        request = self._apply_request_mode(request, is_quick=is_quick)
+        task_resp = self._prepare_task_for_queue(task_id, request, priority=priority)
+
+        if blocking:
+            final_task = await asyncio.to_thread(self._wait_for_task_completion, task_id, 600)
+            self._invoke_on_complete(task_id, on_complete)
+            return final_task
+
+        if on_complete is not None:
+            background_task = asyncio.create_task(
+                self._await_completion_callback(task_id, on_complete)
             )
+            self._track_background_task(background_task)
 
-        result = None
-        try:
-            # Run the sync analysis in thread pool
-            loop = asyncio.get_event_loop()
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, self._run_sync_analysis, task_id, request),
-                timeout=timeout_seconds,
-            )
-
-            # Update task with result in DB
-            now = datetime.utcnow()
-            db = SessionLocal()
-            try:
-                db_task = db.query(AnalysisTask).filter(
-                    AnalysisTask.task_id == task_id
-                ).first()
-                if db_task:
-                    db_task.result = result
-                    db_task.completed_at = now
-                    db_task.updated_at = now
-
-                    if isinstance(result, dict) and result.get("status") == "error":
-                        db_task.status = AnalysisStatus.FAILED.value
-                        db_task.error = result.get("error", "Analysis failed")
-                        db_task.message = f"Analysis failed: {db_task.error}"
-                    else:
-                        db_task.status = AnalysisStatus.COMPLETED.value
-                        db_task.message = f"Analysis completed for {request.symbol}"
-                        # Extract decision from result.signal
-                        if result and result.get("signal"):
-                            signal = result["signal"]
-                            if isinstance(signal, dict):
-                                db_task.decision = signal.get("decision")
-                            elif isinstance(signal, str):
-                                # process_signal() returns raw LLM content; extract last word
-                                # The LLM is prompted to output "BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL"
-                                valid = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
-                                words = signal.strip().split()
-                                for w in reversed(words):
-                                    if w.upper() in valid:
-                                        db_task.decision = w.upper()
-                                        break
-
-                    db.commit()
-
-                    # Call completion callback if provided
-                    if on_complete:
-                        try:
-                            on_complete(task_id, result)
-                        except Exception as cb_err:
-                            logger.warning("Completion callback error: %s", cb_err)
-            except Exception:
-                db.rollback()
-                raise
-            finally:
-                db.close()
-
-        except asyncio.TimeoutError:
-            timeout_error = f"Analysis timed out after {timeout_seconds}s"
-            now = datetime.utcnow()
-            db = SessionLocal()
-            try:
-                db_task = db.query(AnalysisTask).filter(
-                    AnalysisTask.task_id == task_id
-                ).first()
-                if db_task:
-                    db_task.status = AnalysisStatus.FAILED.value
-                    db_task.error = timeout_error
-                    db_task.completed_at = now
-                    db_task.updated_at = now
-                    db_task.message = f"Analysis failed: {timeout_error}"
-                    db.commit()
-
-                    # Call completion callback on timeout error
-                    if on_complete:
-                        try:
-                            on_complete(task_id, {"status": "error", "error": timeout_error})
-                        except Exception as cb_err:
-                            logger.warning("Completion callback error: %s", cb_err)
-            except Exception:
-                db.rollback()
-            finally:
-                db.close()
-        except Exception as e:
-            now = datetime.utcnow()
-            db = SessionLocal()
-            try:
-                db_task = db.query(AnalysisTask).filter(
-                    AnalysisTask.task_id == task_id
-                ).first()
-                if db_task:
-                    db_task.status = AnalysisStatus.FAILED.value
-                    db_task.error = str(e)
-                    db_task.completed_at = now
-                    db_task.updated_at = now
-                    db_task.message = f"Analysis failed: {str(e)}"
-                    db.commit()
-
-                    # Call completion callback on error
-                    if on_complete:
-                        try:
-                            on_complete(task_id, {"status": "error", "error": str(e)})
-                        except Exception as cb_err:
-                            logger.warning("Completion callback error: %s", cb_err)
-            except Exception:
-                db.rollback()
-            finally:
-                db.close()
-
-        # Re-read final state from DB
-        task_resp = self.get_task(task_id)
-        if task_resp is None:
-            # Should not happen — task was just updated — but guard for type safety
-            return AnalysisResponse(
-                task_id=task_id,
-                status=AnalysisStatus.FAILED,
-                symbol=request.symbol,
-                message="Task completed but could not be re-read from database",
-            )
-
-        # Persist to history when task completes (COMPLETED or FAILED)
-        if task_resp and task_resp.status in (AnalysisStatus.COMPLETED, AnalysisStatus.FAILED):
-            try:
-                history_result = dict(task_resp.result or {})
-                history_result["status"] = task_resp.status.value
-                history_result["symbol"] = task_resp.symbol
-                if task_resp.result and isinstance(task_resp.result.get("signal"), dict):
-                    history_result["decision"] = task_resp.result["signal"].get("decision", "UNKNOWN")
-                if task_resp.error:
-                    history_result["error"] = task_resp.error
-                add_to_local_history(
-                    task_id,
-                    task_resp.symbol,
-                    history_result,
-                    created_at=task_resp.created_at or "",
-                    updated_at=task_resp.completed_at or "",
-                )
-            except Exception as hist_err:
-                logger.warning("History persistence warning: %s", hist_err)
-
+        task_resp.message = "Analysis queued for processing"
         return task_resp
+
+    def run_analysis_sync(
+        self,
+        task_id: str,
+        request: AnalysisRequest,
+        priority: int = 10,
+        timeout: int = 600,
+        is_quick: Optional[bool] = None,
+    ) -> AnalysisResponse:
+        """
+        Run analysis synchronously, waiting for completion.
+        
+        This method is used by the scheduler which needs to wait
+        for analysis completion before proceeding.
+
+        Args:
+            task_id: UUID of the task to run
+            request: AnalysisRequest containing analysis parameters
+            priority: Task priority (default 10 for high priority)
+            timeout: Maximum seconds to wait for completion
+
+        Returns:
+            AnalysisResponse with completed analysis result
+        """
+        request = self._apply_request_mode(request, is_quick=is_quick)
+        self._prepare_task_for_queue(task_id, request, priority=priority)
+        return self._wait_for_task_completion(task_id, timeout)
+
+    def _run_sync_analysis(
+        self,
+        task_id: str,
+        request: AnalysisRequest,
+        is_quick: bool = False,
+    ) -> Dict[str, Any]:
+        """Compatibility sync runner used by older tests/debug scripts."""
+        _ = task_id
+        from webapi.subprocess_runner import _resolve_runner_config
+        from tradingagents.core.analysis_runner import AnalysisRunner
+
+        request = self._apply_request_mode(request, is_quick=is_quick)
+        runner_config = _resolve_runner_config(request)
+        runner = AnalysisRunner(
+            symbol=request.symbol,
+            date=request.date or datetime.utcnow().strftime("%Y-%m-%d"),
+            analysts=request.analysts or ["market", "news", "social", "fundamentals"],
+            llm_model=runner_config["llm_model"],
+            llm_provider=runner_config["llm_provider"],
+            base_url=runner_config["base_url"],
+            api_key=runner_config["api_key"],
+            max_iterations=300,
+            fast_mode=request.is_quick,
+        )
+        result = runner.run()
+        result["analysis_type"] = "quick" if request.is_quick else result.get("analysis_type", "full")
+        return result
 
     def _update_task_progress(self, task_id: str, progress_data: Dict[str, Any]):
         """Update task progress in database using targeted column update.
@@ -575,6 +617,7 @@ class AnalysisService:
                     "current_agent": progress_data.get("current_agent", ""),
                     "progress_pct": progress_data.get("progress_pct", 0),
                     "updated_at": datetime.utcnow(),
+                    "message": progress_data.get("message", "") or progress_data.get("current_agent", ""),
                     "logs": updated_logs,
                 }, synchronize_session=False)
                 
@@ -584,90 +627,6 @@ class AnalysisService:
             logger.warning(f"Error updating task progress: {e}")
         finally:
             db.close()
-
-    def _run_sync_analysis(
-        self, task_id: str, request: AnalysisRequest
-    ) -> Dict[str, Any]:
-        """
-        Synchronous analysis runner to be executed in thread pool.
-
-        Args:
-            task_id: UUID of the task
-            request: AnalysisRequest containing analysis parameters
-
-        Returns:
-            Dict containing analysis results
-        """
-        try:
-            # Build parameters for AnalysisRunner
-            symbol = request.symbol
-            date = request.date or datetime.now().strftime("%Y-%m-%d")
-
-            # Determine LLM model and provider
-            # Priority: request params > env vars > model-name heuristic
-            llm_provider = request.llm_provider or os.getenv("LLM_PROVIDER", "openai")
-
-            # Determine model
-            deep_model = request.deep_model or os.getenv("DEEP_THINK_LLM", "gpt-4")
-            quick_model = request.quick_model or os.getenv("QUICK_THINK_LLM", "gpt-4")
-
-            # Auto-detect provider from model name if provider is generic "openai"
-            # but model is clearly a non-OpenAI model (e.g. MiniMax, Gemini)
-            if llm_provider.lower() == "openai" and not request.llm_provider:
-                model_lower = (deep_model + " " + quick_model).lower()
-                if "minimax" in model_lower:
-                    llm_provider = "minimax"
-
-            # Map minimax to openai-compatible with custom base_url
-            base_url = None
-            api_key = None
-            if llm_provider.lower() == "minimax":
-                base_url = os.environ.get("MINIMAX_API_BASE", "https://api.minimax.chat/v1")
-                llm_provider = "openai"  # MiniMax uses OpenAI-compatible API
-                api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
-                deep_model = request.deep_model or os.getenv("DEEP_THINK_LLM", "MiniMax-M2.7")
-                quick_model = request.quick_model or os.getenv("QUICK_THINK_LLM", "MiniMax-M2.7")
-                print(f"[API_KEY_TRACE] analysis_service: minimax mode, api_key length = {len(api_key) if api_key else 0}", flush=True)
-
-            llm_model = deep_model
-
-            analysts = request.analysts or ["market", "news", "fundamentals"]
-
-            # Create runner instance with progress callback
-            runner = AnalysisRunner(
-                symbol=symbol,
-                date=date,
-                analysts=analysts,
-                llm_model=llm_model,
-                llm_provider=llm_provider,
-                max_iterations=300,
-                base_url=base_url,
-                api_key=api_key,
-                progress_callback=lambda data: self._update_task_progress(task_id, data),
-            )
-
-            # Run analysis
-            result = runner.run()
-
-            # Invoke progress callback if registered
-            if task_id in self._progress_callbacks:
-                callback = self._progress_callbacks[task_id]
-                callback(
-                    task_id,
-                    result.get("progress_pct", 0),
-                    result.get("current_agent", ""),
-                )
-
-            return result
-
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": str(e),
-                "traceback": traceback.format_exc(),
-                "progress_pct": 0,
-                "current_agent": "error",
-            }
 
     # ------------------------------------------------------------------
     # Batch operations
@@ -698,6 +657,7 @@ class AnalysisService:
                 exchange=request.exchange,
                 source=request.source,
                 analysts=request.analysts,
+                force_refresh=request.force_refresh,
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
@@ -735,58 +695,21 @@ class AnalysisService:
         )
         self._batch_tasks[batch_id] = batch_response  # Keep for backward compatibility
 
-        # Run all tasks concurrently
-        async def run_single(tid: str, req: AnalysisRequest):
-            return await self.run_analysis(tid, req)
-
+        # Start all tasks asynchronously and return immediately.
         coroutines = [
-            run_single(task.task_id, AnalysisRequest(
+            self.run_analysis(task.task_id, AnalysisRequest(
                 symbol=task.symbol,
                 date=request.date,
                 exchange=request.exchange,
                 source=request.source,
                 analysts=request.analysts,
-            ))
+                force_refresh=request.force_refresh,
+            ), blocking=False)
             for task in tasks
         ]
 
-        results = await asyncio.gather(*coroutines, return_exceptions=True)
-
-        # Calculate final counts
-        failed_count = sum(1 for r in results if isinstance(r, Exception) or (
-            hasattr(r, 'status') and r.status == AnalysisStatus.FAILED
-        ))
-        completed_count = len(results) - failed_count
-        final_status = AnalysisStatus.FAILED if failed_count == len(results) else AnalysisStatus.COMPLETED
-        completed_at = datetime.utcnow()
-
-        # Update batch in database
-        db = SessionLocal()
-        try:
-            db_batch = db.query(AnalysisBatch).filter(
-                AnalysisBatch.batch_id == batch_id
-            ).first()
-            if db_batch:
-                db_batch.completed_count = completed_count
-                db_batch.failed_count = failed_count
-                db_batch.status = final_status.value
-                db_batch.updated_at = completed_at
-                db_batch.completed_at = completed_at
-                db_batch.message = f"Batch completed: {completed_count} succeeded, {failed_count} failed"
-                db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-
-        # Update batch response
+        results = await asyncio.gather(*coroutines)
         batch_response.tasks = results
-        batch_response.completed_count = completed_count
-        batch_response.failed_count = failed_count
-        batch_response.status = final_status
-        batch_response.updated_at = completed_at.isoformat()
-        batch_response.completed_at = completed_at.isoformat()
 
         self._batch_tasks[batch_id] = batch_response
         return batch_response
@@ -853,6 +776,11 @@ class AnalysisService:
                 )
                 db_task.updated_at = datetime.utcnow()
                 db.commit()
+
+                try:
+                    self.queue_service.cancel(task_id, "Task cancelled")
+                except Exception:
+                    logger.exception("Failed to update queue state during cancellation for %s", task_id)
                 return True
 
             return False
@@ -877,6 +805,7 @@ class AnalysisService:
                 exchange=request.exchange,
                 source=request.source,
                 analysts=request.analysts,
+                force_refresh=request.force_refresh,
             )
             task_response = self.create_task(single_request)
             tasks.append(task_response)
@@ -918,8 +847,9 @@ class AnalysisService:
         return batch_response
 
     def shutdown(self) -> None:
-        """Shutdown the thread pool executor."""
-        self._executor.shutdown(wait=True)
+        """Shutdown cleanup (no-op for queue-based architecture)."""
+        # ThreadPoolExecutor removed - queue-based architecture uses subprocess
+        pass
 
 
 # Global singleton instance

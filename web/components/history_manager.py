@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import threading
 import traceback
 import requests
 from datetime import datetime
@@ -18,6 +19,54 @@ DELETED_IDS_FILE = os.path.join(HISTORY_DIR, "deleted_ids.json")
 # API URL - use same default as app.py
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
+STATUS_CONFIG = {
+    "PENDING": ("⏳", "等待中", "#FFA500"),
+    "RUNNING": ("🔄", "分析中", "#2196F3"),
+    "COMPLETED": ("✅", "完成", "#4CAF50"),
+    "FAILED": ("❌", "失败", "#F44336"),
+    "CANCELLED": ("⏹️", "已取消", "#9E9E9E"),
+}
+
+STEP_NAMES = {
+    "graph_setup": "初始化分析图",
+    "market_analyst": "市场分析师",
+    "sentiment_analyst": "情绪分析师",
+    "news_analyst": "新闻分析师",
+    "fundamentals_analyst": "基本面分析师",
+    "bull_researcher": "看涨研究员",
+    "bear_researcher": "看跌研究员",
+    "research_manager": "研究经理",
+    "trader": "交易员",
+    "risk_manager": "风控经理",
+    "portfolio_manager": "投资组合经理",
+    "propagate": "多智能体分析",
+    "completed": "分析完成",
+    "error": "执行失败",
+}
+
+DECISION_TEXT_MAP = {
+    "BUY": ("买入", "#4CAF50"),
+    "OVERWEIGHT": ("增持", "#2E7D32"),
+    "HOLD": ("持有", "#FF9800"),
+    "UNDERWEIGHT": ("减持", "#FB8C00"),
+    "SELL": ("卖出", "#F44336"),
+    "UNKNOWN": ("未知", "#9E9E9E"),
+}
+
+CORE_STEPS = [
+    "graph_setup",
+    "market_analyst",
+    "sentiment_analyst",
+    "news_analyst",
+    "fundamentals_analyst",
+    "bull_researcher",
+    "bear_researcher",
+    "research_manager",
+    "trader",
+    "risk_manager",
+    "portfolio_manager",
+]
+
 
 def ensure_history_dir():
     """Ensure history directory exists."""
@@ -25,7 +74,7 @@ def ensure_history_dir():
         os.makedirs(HISTORY_DIR)
 
 
-def load_deleted_ids() -> set:
+def load_deleted_ids() -> set[str]:
     """Load set of deleted task IDs (tombstone)."""
     if not os.path.exists(DELETED_IDS_FILE):
         return set()
@@ -38,7 +87,7 @@ def load_deleted_ids() -> set:
         return set()
 
 
-def save_deleted_ids(deleted_ids: set):
+def save_deleted_ids(deleted_ids: set[str]):
     """Save deleted task IDs to tombstone file."""
     ensure_history_dir()
     with open(DELETED_IDS_FILE, 'w', encoding='utf-8') as f:
@@ -249,7 +298,7 @@ def add_to_history(task_id: str, symbol: str, result: Dict[str, Any]):
         symbol: Stock symbol
         result: Analysis result data
     """
-    records = load_history()
+    records = load_history_fast()  # Use fast version (1.5s timeout) for better UX
     
     # Check if already exists
     for record in records:
@@ -310,6 +359,8 @@ def delete_from_history(task_id: str) -> bool:
     local cache entry.  Falls back to local-only delete when the API is
     unreachable so the UI still works offline.
 
+    Thread-safe: does not call st.* when run from a background thread.
+
     Args:
         task_id: Task ID to delete
 
@@ -321,16 +372,14 @@ def delete_from_history(task_id: str) -> bool:
     try:
         resp = requests.delete(
             f"{API_URL}/api/v1/analysis/{task_id}",
-            timeout=5,
+            timeout=2,  # Reduced from 5s for faster feedback
         )
         if resp.status_code == 204:
             api_ok = True
         elif resp.status_code == 404:
-            st.error("任务不存在")
-            return False
-        else:
-            st.error(f"删除失败: {resp.status_code}")
-            return False
+            # Task may already be deleted or only exists locally
+            api_ok = True  # Treat as success so local cleanup proceeds
+        # Other status codes: still try local cleanup
     except Exception:
         # API unreachable — fall back to local-only delete
         traceback.print_exc(file=sys.stderr)
@@ -363,7 +412,7 @@ def get_history_item(task_id: str) -> Optional[Dict[str, Any]]:
     Returns:
         History record or None
     """
-    records = load_history()
+    records = load_history_fast()  # Use fast version (1.5s timeout) for better UX
     for record in records:
         if record.get("task_id") == task_id:
             return record
@@ -509,18 +558,59 @@ def get_task_progress(task_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def extract_task_timing(task: Dict[str, Any], result_data: Optional[Dict[str, Any]] = None) -> tuple[int, Optional[int]]:
+    """Extract elapsed and remaining time from task/result data."""
+    data = result_data if isinstance(result_data, dict) else task.get("raw_result", {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+
+    elapsed_time = data.get("elapsed_time")
+    remaining_time = data.get("remaining_time")
+
+    try:
+        elapsed = max(0, int(elapsed_time)) if elapsed_time is not None else 0
+    except (TypeError, ValueError):
+        elapsed = 0
+
+    if remaining_time is None:
+        remaining = None
+    else:
+        try:
+            remaining = max(0, int(remaining_time))
+        except (TypeError, ValueError):
+            remaining = None
+
+    if elapsed == 0:
+        created_at = task.get("created_at", "")
+        updated_at = task.get("updated_at", "")
+        if created_at:
+            try:
+                start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00')).replace(tzinfo=None)
+                if updated_at and task.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+                    end_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00')).replace(tzinfo=None)
+                else:
+                    end_dt = datetime.now()
+                elapsed = max(0, int((end_dt - start_dt).total_seconds()))
+            except Exception:
+                elapsed = 0
+
+    return elapsed, remaining
+
+
+def simplify_step_status(agents_progress: Dict[str, Any], current_agent: str) -> List[tuple[str, str, str]]:
+    """Build simplified core step statuses for detail rendering."""
+    items: List[tuple[str, str, str]] = []
+    for step_id in CORE_STEPS:
+        raw_status = agents_progress.get(step_id, "not_started") if isinstance(agents_progress, dict) else "not_started"
+        if step_id == current_agent and raw_status == "not_started":
+            raw_status = "in_progress"
+        items.append((step_id, STEP_NAMES.get(step_id, step_id), raw_status))
+    return items
+
+
 def format_duration(seconds: int) -> str:
     """Format duration in seconds to human readable string."""
-    if seconds < 60:
-        return f"{seconds}秒"
-    elif seconds < 3600:
-        mins = seconds // 60
-        secs = seconds % 60
-        return f"{mins}分{secs}秒"
-    else:
-        hours = seconds // 3600
-        mins = (seconds % 3600) // 60
-        return f"{hours}小时{mins}分"
+    return format_time(seconds)
 
 
 def render_history_manager() -> Optional[str]:
@@ -629,36 +719,6 @@ def render_history_manager() -> Optional[str]:
         # Display history list
         selected_task_id = None
 
-        # Configuration mappings
-        status_config = {
-            "PENDING": ("⏳", "等待中", "#FFA500"),
-            "RUNNING": ("🔄", "分析中", "#2196F3"),
-            "COMPLETED": ("✅", "完成", "#4CAF50"),
-            "FAILED": ("❌", "失败", "#F44336")
-        }
-
-        step_names = {
-            "graph_setup": "初始化分析图",
-            "research_manager": "研究经理",
-            "market_analyst": "市场分析师",
-            "sentiment_analyst": "情绪分析师",
-            "news_analyst": "新闻分析师",
-            "fundamentals_analyst": "基本面分析师",
-            "bull_researcher": "看涨研究员",
-            "bear_researcher": "看跌研究员",
-            "trader": "交易员",
-            "risk_manager": "风控经理",
-            "portfolio_manager": "投资组合经理",
-            "propagate": "多智能体分析"
-        }
-
-        decision_text_map = {
-            "BUY": ("买入", "#4CAF50"),
-            "SELL": ("卖出", "#F44336"),
-            "HOLD": ("持有", "#FF9800"),
-            "UNKNOWN": ("未知", "#9E9E9E")
-        }
-
         for idx, record in enumerate(filtered_records):
             task_id = record.get("task_id", "")
             symbol = record.get("symbol", "Unknown")
@@ -679,49 +739,47 @@ def render_history_manager() -> Optional[str]:
 
             # Card layout: 4 columns [2, 2, 1.5, 1.5]
             col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1.5])
+            elapsed, _ = extract_task_timing(record, raw_result)
+            status_icon, status_text, status_color = STATUS_CONFIG.get(status, ("⚪", status or "未知", "#9E9E9E"))
 
             with col1:
                 st.markdown(f"### 📊 {symbol}")
                 st.caption(f"🕐 {date_str}")
+                st.caption(f"{status_icon} {status_text}")
 
             with col2:
                 if status == "RUNNING":
-                    # Get progress data from raw_result
-                    progress_pct = raw_result.get("progress_pct", 0) or 0
+                    progress_pct = int(raw_result.get("progress_pct", 0) or 0)
                     current_agent = raw_result.get("current_agent", "")
-                    step_name = step_names.get(current_agent, current_agent) if current_agent else "分析中"
+                    step_name = STEP_NAMES.get(current_agent, current_agent) if current_agent else "分析中"
+                    progress_indeterminate = bool(raw_result.get("is_progress_indeterminate"))
                     st.progress(progress_pct / 100, text=f"{progress_pct}%")
-                    st.caption(f"🔄 {step_name}")
+                    st.caption(f"📍 当前: {step_name}")
+                    st.caption(f"⏱️ 已用: {format_time(elapsed)}")
+                    if progress_indeterminate:
+                        st.caption("⏳ 剩余: 计算中...")
                 elif status == "COMPLETED":
-                    # Show decision with color
-                    decision_info = decision_text_map.get(decision, (decision, "#9E9E9E"))
+                    decision_info = DECISION_TEXT_MAP.get(decision, (decision or "未知", "#9E9E9E"))
                     decision_text, decision_color = decision_info
-                    
-                    # Check if task actually failed
+
                     result_error = raw_result.get("error")
                     if result_error:
                         st.markdown(f"<span style='color: #F44336'>❌ 分析失败</span>", unsafe_allow_html=True)
                     else:
                         st.markdown(f"<span style='color: {decision_color}; font-weight: bold;'>{decision_text}</span>", unsafe_allow_html=True)
-                        
-                        # Show duration
-                        duration_text = ""
-                        if created_at and updated_at:
-                            try:
-                                created_dt = datetime.fromisoformat(created_at)
-                                updated_dt = datetime.fromisoformat(updated_at)
-                                duration = (updated_dt - created_dt).total_seconds()
-                                duration_text = f"⏱️ 耗时: {format_duration(int(duration))}"
-                            except Exception:
-                                pass
-                        if duration_text:
-                            st.caption(duration_text)
+                        if elapsed > 0:
+                            st.caption(f"⏱️ 耗时: {format_time(elapsed)}")
                 elif status == "FAILED":
                     st.markdown(f"<span style='color: #F44336'>❌ 失败</span>", unsafe_allow_html=True)
+                    if elapsed > 0:
+                        st.caption(f"⏱️ 已运行: {format_time(elapsed)}")
                 else:
-                    # PENDING
-                    status_emoji, status_text, _ = status_config.get(status, ("⚪", status, "#9E9E9E"))
-                    st.write(f"{status_emoji} {status_text}")
+                    st.markdown(
+                        f"<span style='color: {status_color}; font-weight: 600;'>{status_icon} {status_text}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    if elapsed > 0:
+                        st.caption(f"⏱️ 已等待: {format_time(elapsed)}")
 
             with col3:
                 if st.button("👁️ 查看", key=f"view_{task_id}", help="查看详情", use_container_width=True):
@@ -729,7 +787,16 @@ def render_history_manager() -> Optional[str]:
 
             with col4:
                 if st.button("🗑️ 删除", key=f"del_{task_id}", help="删除记录", use_container_width=True):
-                    delete_from_history(task_id)
+                    # Optimistic delete: instantly remove from cache, fire API in background
+                    st.session_state.history_cache = [
+                        r for r in st.session_state.get("history_cache", [])
+                        if r.get("task_id") != task_id
+                    ]
+                    st.session_state.history_cache_time = datetime.now().timestamp()
+                    # Fire-and-forget: delete from API in background thread
+                    threading.Thread(
+                        target=delete_from_history, args=(task_id,), daemon=True
+                    ).start()
                     st.rerun()
 
             st.divider()
@@ -892,111 +959,49 @@ def render_history_detail(task_id: str):
         except Exception:
             date_str = created_at
 
+        status_icon, status_text, _ = STATUS_CONFIG.get(status, ("⚪", status or "未知", "#9E9E9E"))
+        elapsed_time, remaining_time = extract_task_timing(
+            {"created_at": created_at, "updated_at": api_data.get("updated_at", "") if api_data else record.get("updated_at", "") if record else "", "status": status},
+            result_data,
+        )
+        current_agent = result_data.get("current_agent", "") if isinstance(result_data, dict) else ""
+        progress_pct = int(result_data.get("progress_pct", 0) or 0) if isinstance(result_data, dict) else 0
+        progress_indeterminate = bool(result_data.get("is_progress_indeterminate")) if isinstance(result_data, dict) else False
+
         st.header(f"📊 {symbol} 分析详情")
-        st.caption(f"📅 {date_str} | 状态: {status}")
+        st.caption(f"📅 {date_str} | {status_icon} {status_text}")
 
         st.divider()
 
         # Real-time progress section (only for PENDING/RUNNING tasks)
         if status in ("PENDING", "RUNNING"):
             st.subheader("🔄 实时分析进度")
-            
-            # Get progress data from result_data
             agents_progress = result_data.get("agents_progress", {})
-            current_agent = result_data.get("current_agent", "")
-            progress_pct = result_data.get("progress_pct", 0)
-            elapsed_time = result_data.get("elapsed_time", 0) or 0
-            remaining_time = result_data.get("remaining_time", 0) or 0
-            
-            # Display overall progress
+
             st.progress(progress_pct / 100, text=f"整体进度: {progress_pct}%")
-            
-            # Time metrics
+
             col1, col2 = st.columns(2)
             with col1:
                 st.caption(f"⏱️ 已用时间: {format_time(elapsed_time)}")
             with col2:
-                st.caption(f"⏳ 预计剩余: {format_time(remaining_time)}")
-            
-            # Define the 11 analysis steps
-            steps = [
-                ("graph_setup", "🚀", "初始化分析图"),
-                ("research_manager", "🔍", "研究经理"),
-                ("market_analyst", "📊", "市场分析师"),
-                ("sentiment_analyst", "💭", "情绪分析师"),
-                ("news_analyst", "📰", "新闻分析师"),
-                ("fundamentals_analyst", "🏢", "基本面分析师"),
-                ("bull_researcher", "🐂", "看涨研究员"),
-                ("bear_researcher", "🐻", "看跌研究员"),
-                ("trader", "💼", "交易员"),
-                ("risk_manager", "⚠️", "风控经理"),
-                ("portfolio_manager", "👔", "投资组合经理"),
-            ]
-            
-            # Determine step status based on agents_progress
-            # completed -> ✅, in_progress -> 🔄, failed -> ❌, not_started -> ⏳
-            def get_step_status(step_id):
-                step_status = agents_progress.get(step_id, "not_started")
+                if remaining_time is not None and not progress_indeterminate:
+                    st.caption(f"⏳ 预计剩余: {format_time(remaining_time)}")
+                else:
+                    st.caption("⏳ 预计剩余: 计算中...")
+
+            current_step_name = STEP_NAMES.get(current_agent, current_agent or "分析处理中")
+            current_step_desc = "正在持续接收流式进度更新" if progress_pct > 0 else "任务已创建，等待执行"
+            st.info(f"{status_icon} **{current_step_name}** - {current_step_desc}")
+
+            simplified_steps = simplify_step_status(agents_progress, current_agent)
+            for step_id, step_name, step_status in simplified_steps:
                 if step_status == "completed":
-                    return "✅"
+                    st.caption(f"✅ {step_name}")
                 elif step_status == "in_progress":
-                    return "🔄"
+                    st.caption(f"🔄 {step_name}")
                 elif step_status == "failed":
-                    return "❌"
-                return "⏳"
-            
-            # Display steps in a timeline layout using columns (3 rows: 4+4+3)
-            cols = st.columns(4)
-            step_icons = []
-            for i, (step_id, emoji, step_name) in enumerate(steps):
-                status_icon = get_step_status(step_id)
-                is_current = (step_id == current_agent)
-                marker = " >>>" if is_current else ""
-                step_icons.append(f"{status_icon} {emoji} {step_name}{marker}")
-            
-            # Show first row (4 steps)
-            for i, text in enumerate(step_icons[:4]):
-                with cols[i]:
-                    st.write(text)
-            
-            # Show second row (4 steps)
-            cols2 = st.columns(4)
-            for i, text in enumerate(step_icons[4:8]):
-                with cols2[i]:
-                    st.write(text)
-            
-            # Show third row (3 steps)
-            cols3 = st.columns(4)
-            for i, text in enumerate(step_icons[8:]):
-                with cols3[i]:
-                    st.write(text)
-            
-            # Generate activity logs based on agents_progress
-            st.subheader("📋 活动日志")
-            logs = []
-            logs.append(f"[{date_str}] 任务已启动")
-            
-            # Add logs for each completed agent
-            for step_id, emoji, step_name in steps:
-                step_status = agents_progress.get(step_id, "not_started")
-                if step_status == "completed":
-                    logs.append(f"[{date_str}] ✅ {step_name} 已完成")
-                elif step_status == "in_progress":
-                    logs.append(f"[{date_str}] 🔄 正在执行: {step_name}")
-                elif step_status == "failed":
-                    logs.append(f"[{date_str}] ❌ {step_name} 执行失败")
-            
-            # Highlight current agent
-            if current_agent:
-                for step_id, emoji, step_name in steps:
-                    if step_id == current_agent:
-                        logs.append(f"[{date_str}] >>> 正在执行: {step_name}")
-                        break
-            
-            logs_text = "\n".join(logs)
-            st.code(logs_text, language=None)
-            
-            # Refresh controls
+                    st.caption(f"❌ {step_name}")
+
             col1, col2 = st.columns([1, 1])
             with col1:
                 if st.button("🔄 刷新进度", key=f"refresh_{task_id}"):
@@ -1024,8 +1029,7 @@ def render_history_detail(task_id: str):
                 if analysis_error:
                     st.error("❌ 分析失败")
                 else:
-                    decision_text = {"BUY": "买入", "SELL": "卖出", "HOLD": "持有"}.get(decision, decision)
-                    color = decision_colors.get(decision, "gray")
+                    decision_text, color = DECISION_TEXT_MAP.get(decision, (decision, "gray"))
                     st.markdown(f"### <span style='color: {color}'>{decision_text}</span>", unsafe_allow_html=True)
             with col2:
                 st.subheader("📊 置信度")
@@ -1045,6 +1049,12 @@ def render_history_detail(task_id: str):
                 else:
                     st.write("中等")
 
+            metrics_col1, metrics_col2 = st.columns(2)
+            with metrics_col1:
+                st.caption(f"⏱️ 已用时间: {format_time(elapsed_time)}")
+            with metrics_col2:
+                st.caption("✅ 分析完成" if status == "COMPLETED" else "❌ 分析失败")
+
             st.divider()
 
         # Show reports in tabs for better readability
@@ -1056,7 +1066,6 @@ def render_history_detail(task_id: str):
             final_state_for_tabs = result_data["final_state"]
 
         if final_state_for_tabs:
-            # Report tabs mapping
             reports = {
                 'final_trade_decision': '🎯 最终交易决策',
                 'fundamentals_report': '💰 基本面分析',
@@ -1068,10 +1077,38 @@ def render_history_detail(task_id: str):
 
             available_reports = {k: v for k, v in reports.items() if k in final_state_for_tabs and final_state_for_tabs[k]}
             if available_reports:
+                st.subheader("📚 分析报告")
                 tabs = st.tabs(list(available_reports.values()))
                 for i, (tab, (report_key, report_name)) in enumerate(zip(tabs, available_reports.items())):
                     with tab:
                         st.markdown(final_state_for_tabs[report_key])
+
+        # Show LLM agent outputs if available (post-analysis review)
+        llm_streams = None
+        if api_data and api_data.get("llm_streams"):
+            llm_streams = api_data["llm_streams"]
+        elif result_data and result_data.get("llm_streams"):
+            llm_streams = result_data["llm_streams"]
+
+        if llm_streams and isinstance(llm_streams, dict) and any(llm_streams.values()):
+            with st.expander("🤖 智能体详细输出 (LLM Streams)", expanded=False):
+                st.caption("各分析智能体的完整输出文本，用于审计和调试")
+                agent_display_names = {
+                    "market_analyst": "📊 市场分析师",
+                    "sentiment_analyst": "💭 情绪分析师",
+                    "news_analyst": "📰 新闻分析师",
+                    "fundamentals_analyst": "🏢 基本面分析师",
+                    "bull_researcher": "🐂 看涨研究员",
+                    "bear_researcher": "🐻 看跌研究员",
+                    "research_manager": "🔍 研究经理",
+                    "trader": "💼 交易员",
+                    "portfolio_manager": "👔 投资组合经理",
+                }
+                for agent_key, display_name in agent_display_names.items():
+                    content = llm_streams.get(agent_key)
+                    if content and isinstance(content, str) and content.strip():
+                        with st.expander(display_name):
+                            st.markdown(content)
 
         # Show summary as markdown if available (outside tabs)
         if summary:

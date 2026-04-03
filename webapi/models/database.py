@@ -1,11 +1,15 @@
 """SQLAlchemy ORM models for TradingAgents database."""
-from datetime import datetime
-from typing import Any, Dict, Optional
 
-from sqlalchemy import Column, DateTime, Index, Integer, String, Text
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportExplicitAny=false, reportGeneralTypeIssues=false, reportAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnannotatedClassAttribute=false, reportDeprecated=false, reportUnusedImport=false
+
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Sequence
+
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session
 
-from webapi.config.database import Base
+from webapi.config.database import Base, SessionLocal
 
 
 class AnalysisTask(Base):
@@ -41,6 +45,7 @@ class AnalysisTask(Base):
     current_agent = Column(String(50), nullable=True)
     progress_pct = Column(Integer, nullable=True, default=0)
     logs = Column(JSONB, nullable=True, default=list)
+    llm_streams = Column(JSONB, nullable=True)  # Per-agent LLM output text
 
     # Table configuration
     __table_args__ = (
@@ -66,6 +71,7 @@ class AnalysisTask(Base):
             'current_agent': self.current_agent,
             'progress_pct': self.progress_pct,
             'logs': self.logs,
+            'llm_streams': self.llm_streams,
         }
     
     @classmethod
@@ -87,6 +93,7 @@ class AnalysisTask(Base):
             current_agent=data.get('current_agent'),
             progress_pct=data.get('progress_pct'),
             logs=data.get('logs'),
+            llm_streams=data.get('llm_streams'),
         )
     
     @classmethod
@@ -120,6 +127,7 @@ class AnalysisTask(Base):
             current_agent=getattr(response, 'current_agent', None),
             progress_pct=getattr(response, 'progress_pct', None),
             logs=getattr(response, 'logs', None),
+            llm_streams=getattr(response, 'llm_streams', None),
         )
 
 
@@ -189,6 +197,71 @@ class AnalysisBatch(Base):
             message=data.get('message'),
             error=data.get('error'),
         )
+
+
+class AnalysisQueue(Base):
+    """PostgreSQL-based task queue for analysis jobs."""
+    
+    __tablename__ = "analysis_queue"
+    
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Foreign key to analysis task
+    task_id = Column(
+        String(36),
+        ForeignKey("analysis_tasks.task_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    
+    # Queue status
+    status = Column(String(20), nullable=False, index=True)  # QUEUED, PROCESSING, COMPLETED, FAILED
+    
+    # Priority (higher = more important)
+    priority = Column(Integer, nullable=False, default=0, index=True)
+    
+    # Retry mechanism
+    retry_count = Column(Integer, nullable=False, default=0)
+    max_retries = Column(Integer, nullable=False, default=3)
+
+    # Serialized request payload used by workers/subprocesses
+    request_payload = Column(JSONB, nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    
+    # Worker tracking
+    worker_id = Column(String(50), nullable=True)
+    
+    # Error tracking
+    error_message = Column(Text, nullable=True)
+    
+    # Table configuration
+    __table_args__ = (
+        Index('idx_queue_status_priority', 'status', 'priority', 'created_at'),
+        Index('idx_queue_task_id', 'task_id'),
+        UniqueConstraint('task_id', name='uq_analysis_queue_task_id'),
+    )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            'id': self.id,
+            'task_id': self.task_id,
+            'status': self.status,
+            'priority': self.priority,
+            'retry_count': self.retry_count,
+            'max_retries': self.max_retries,
+            'request_payload': self.request_payload,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'worker_id': self.worker_id,
+            'error_message': self.error_message,
+        }
 
 
 class Watchlist(Base):
@@ -298,7 +371,7 @@ class WatchlistAnalysis(Base):
     signal = Column(String(20), nullable=True)  # BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL
     confidence = Column(String(10), nullable=True)
     risk_level = Column(String(20), nullable=True)
-    price = Column(String(20), nullable=True)  # Stock price at analysis time
+    price = Column(Float, nullable=True)  # Stock price at analysis time
     error_message = Column(Text, nullable=True)  # Error details if analysis failed
     
     # Turning detection
@@ -329,7 +402,7 @@ class WatchlistAnalysis(Base):
             'signal': self.signal,
             'confidence': float(self.confidence) if self.confidence else None,
             'risk_level': self.risk_level,
-            'price': float(self.price) if self.price else None,
+            'price': self.price,
             'error_message': self.error_message,
             'is_turning_point': self.is_turning_point == 'Y',
             'turning_reason': self.turning_reason,
@@ -352,7 +425,7 @@ class WatchlistAnalysis(Base):
             signal=data.get('signal'),
             confidence=str(data['confidence']) if data.get('confidence') is not None else None,
             risk_level=data.get('risk_level'),
-            price=str(data['price']) if data.get('price') is not None else None,
+            price=float(data['price']) if data.get('price') is not None else None,
             error_message=data.get('error_message'),
             is_turning_point='Y' if data.get('is_turning_point', False) else 'N',
             turning_reason=data.get('turning_reason'),
@@ -360,6 +433,36 @@ class WatchlistAnalysis(Base):
             alert_sent='Y' if data.get('alert_sent', False) else 'N',
             alert_sent_at=datetime.fromisoformat(data['alert_sent_at']) if data.get('alert_sent_at') else None,
         )
+
+    @classmethod
+    def get_analysis_history(
+        cls,
+        watchlist_id: int,
+        limit: int = 50,
+        db: Optional[Session] = None,
+    ) -> Sequence["WatchlistAnalysis"]:
+        """Get completed analysis history for a watchlist item.
+
+        Args:
+            watchlist_id: Watchlist entry ID.
+            limit: Maximum records to return.
+            db: Optional existing SQLAlchemy session.
+
+        Returns:
+            Completed analysis rows ordered newest first.
+        """
+        owns_session = db is None
+        session = db or SessionLocal()
+
+        try:
+            query = session.query(cls).filter(
+                cls.watchlist_id == watchlist_id,
+                cls.completed_at.isnot(None),
+            ).order_by(cls.created_at.desc())
+            return query.limit(limit).all()
+        finally:
+            if owns_session:
+                session.close()
 
 
 class WatchlistConfig(Base):
@@ -383,13 +486,15 @@ class WatchlistConfig(Base):
     )
     
     @classmethod
-    def get_value(cls, db, key: str, default: str = None) -> str:
+    def get_value(cls, db: Session, key: str, default: Optional[str] = None) -> Optional[str]:
         """Get configuration value by key."""
         config = db.query(cls).filter(cls.config_key == key).first()
-        return config.config_value if config else default
+        if config is None or config.config_value is None:
+            return default
+        return str(config.config_value)
     
     @classmethod
-    def set_value(cls, db, key: str, value: str) -> None:
+    def set_value(cls, db: Session, key: str, value: str) -> None:
         """Set configuration value by key."""
         config = db.query(cls).filter(cls.config_key == key).first()
         if config:
@@ -401,7 +506,7 @@ class WatchlistConfig(Base):
         db.commit()
     
     @classmethod
-    def init_defaults(cls, db) -> None:
+    def init_defaults(cls, db: Session) -> None:
         """Initialize default configuration values."""
         defaults = {
             'monitoring_active': 'false',
@@ -413,3 +518,106 @@ class WatchlistConfig(Base):
             if not exists:
                 db.add(cls(config_key=key, config_value=value))
         db.commit()
+
+
+class AnalystReportCache(Base):
+    """Analyst report cache for storing and reusing LLM analysis results.
+    
+    Supports differentiated TTL per analyst type:
+    - market: 15 minutes
+    - sentiment: 2 hours  
+    - news: 2 hours
+    - fundamentals: 24 hours
+    """
+    
+    __tablename__ = "analyst_report_cache"
+    
+    # Primary key
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Cache key fields
+    symbol = Column(String(20), nullable=False, index=True)
+    analyst_type = Column(String(20), nullable=False)  # market, sentiment, news, fundamentals
+    analysis_date = Column(Date, nullable=False)
+    
+    # Cache content
+    report_content = Column(Text, nullable=False)
+    
+    # Optimistic locking and session tracking
+    cache_version = Column(Integer, nullable=False, default=1)
+    lock_session_id = Column(String(100), nullable=True)
+    
+    # Timestamps and TTL
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    is_valid = Column(Boolean, nullable=False, default=True)
+    
+    # Table configuration with composite index
+    __table_args__ = (
+        Index('ix_analyst_report_cache_symbol_analyst_type_date', 
+              'symbol', 'analyst_type', 'analysis_date'),
+        Index('ix_analyst_report_cache_lock_session', 'lock_session_id',
+              postgresql_where=is_valid == True),
+        Index('ix_analyst_report_cache_expires', 'expires_at',
+              postgresql_where=is_valid == True),
+    )
+    
+    # TTL configuration per analyst type (in seconds)
+    TTL_CONFIG = {
+        'market': 900,        # 15 minutes
+        'sentiment': 7200,    # 2 hours
+        'news': 7200,         # 2 hours
+        'fundamentals': 86400 # 24 hours
+    }
+    
+    def is_expired(self) -> bool:
+        """Check if cache entry has expired."""
+        return bool(datetime.utcnow() > self.expires_at)
+    
+    def is_cache_valid(self) -> bool:
+        """Check if cache is valid (not expired and is_valid flag is True)."""
+        return bool(self.is_valid) and not self.is_expired()
+    
+    @classmethod
+    def get_ttl_seconds(cls, analyst_type: str) -> int:
+        """Get TTL in seconds for a given analyst type."""
+        return cls.TTL_CONFIG.get(analyst_type, 3600)  # Default 1 hour
+    
+    @classmethod
+    def calculate_expires_at(cls, analyst_type: str) -> datetime:
+        """Calculate expiration time based on analyst type."""
+        ttl_seconds = cls.get_ttl_seconds(analyst_type)
+        return datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'analyst_type': self.analyst_type,
+            'analysis_date': self.analysis_date.isoformat() if self.analysis_date else None,
+            'report_content': self.report_content,
+            'cache_version': self.cache_version,
+            'lock_session_id': self.lock_session_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'is_valid': self.is_valid,
+            'is_expired': self.is_expired(),
+            'is_cache_valid': self.is_cache_valid(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AnalystReportCache":
+        """Create instance from dictionary."""
+        return cls(
+            id=data.get('id'),
+            symbol=data.get('symbol', ''),
+            analyst_type=data.get('analyst_type', ''),
+            analysis_date=datetime.fromisoformat(data['analysis_date']).date() if data.get('analysis_date') else None,
+            report_content=data.get('report_content', ''),
+            cache_version=data.get('cache_version', 1),
+            lock_session_id=data.get('lock_session_id'),
+            created_at=datetime.fromisoformat(data['created_at']) if data.get('created_at') else datetime.utcnow(),
+            expires_at=datetime.fromisoformat(data['expires_at']) if data.get('expires_at') else cls.calculate_expires_at(data.get('analyst_type', 'market')),
+            is_valid=data.get('is_valid', True),
+        )

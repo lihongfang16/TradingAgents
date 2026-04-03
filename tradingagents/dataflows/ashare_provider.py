@@ -232,7 +232,7 @@ def get_price_tencent(code, end_date='', count=10, frequency='1d'):
         return df
         
     except Exception as e:
-        print(f"Tencent data fetch error: {e}")
+        logger.warning(f"Tencent data fetch error: {e}")
         return None
 
 
@@ -364,10 +364,10 @@ class AshareProvider:
                     return df
                     
             except Exception as e:
-                print(f"Ashare {source} error for {symbol}: {e}")
+                logger.warning(f"Ashare {source} error for {symbol}: {e}")
                 continue
         
-        print(f"All Ashare sources failed for {symbol}")
+        logger.warning(f"All Ashare sources failed for {symbol}")
         return None
     
     def get_daily_hist(self, symbol: str, days: int = 120) -> Optional[pd.DataFrame]:
@@ -445,7 +445,7 @@ class AshareProvider:
             }
             
         except Exception as e:
-            print(f"Ashare real-time quote error: {e}")
+            logger.warning(f"Ashare real-time quote error: {e}")
             return None
     
     def get_fundamental_data(self, symbol: str) -> Optional[Dict[str, Any]]:
