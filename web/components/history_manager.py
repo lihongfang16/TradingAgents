@@ -17,7 +17,7 @@ HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
 DELETED_IDS_FILE = os.path.join(HISTORY_DIR, "deleted_ids.json")
 
 # API URL - use same default as app.py
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:8002")
 
 STATUS_CONFIG = {
     "PENDING": ("⏳", "等待中", "#FFA500"),

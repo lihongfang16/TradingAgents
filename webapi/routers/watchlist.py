@@ -4,7 +4,7 @@ Watchlist Router for TradingAgents API
 
 # pyright: reportGeneralTypeIssues=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportCallIssue=false, reportImportCycles=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportCallInDefaultInitializer=false, reportUnusedCallResult=false, reportDeprecated=false, reportUnusedFunction=false, reportUnannotatedClassAttribute=false, reportUnusedParameter=false
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 import asyncio
 
 from webapi.config.database import get_db
-from webapi.models.database import Watchlist, WatchlistAnalysis, WatchlistConfig
+from webapi.models.database import Watchlist, WatchlistAnalysis, WatchlistConfig, AnalysisTask
 from webapi.models.analysis import AnalysisRequest, AnalysisResponse, StockExchange, AnalysisHistoryResponse, AnalysisHistoryItem
 
 # Lazy import analysis_service to avoid slow startup
@@ -557,6 +557,132 @@ async def trigger_scheduler_job(job_id: str, db: Session = Depends(get_db)):
 
 
 # ============================================================================
+# Batch Status API (N+1 Query Optimization)
+# ============================================================================
+
+
+class WatchlistBatchStatusItem(BaseModel):
+    """Single stock analysis status in batch response."""
+
+    is_analyzing: bool = False
+    has_full_analysis_today: bool = False
+    has_multiple_analyses: bool = False
+    last_analysis_at: Optional[str] = None
+
+
+@router.get("/analysis-status", response_model=Dict[str, Any])
+async def get_analysis_status_batch(
+    symbols: str = Query(..., description="Comma-separated stock symbols, max 50"),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Get analysis status for multiple stocks in a single request.
+
+    Replaces 3N individual API calls with a single batch query.
+    Returns status for all requested symbols. Symbols with no data
+    return default values (all False). Invalid formats return 400.
+
+    Args:
+        symbols: Comma-separated 6-digit A-share codes (e.g. "000001,000002")
+        db: SQLAlchemy session
+
+    Returns:
+        Dict mapping symbol -> {is_analyzing, has_full_analysis_today,
+        has_multiple_analyses, last_analysis_at}
+    """
+    import re
+    from sqlalchemy import case
+
+    # --- Input validation ---
+    if not symbols or not symbols.strip():
+        raise HTTPException(status_code=400, detail="symbols参数不能为空")
+
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    if not symbol_list:
+        raise HTTPException(status_code=400, detail="至少需要一个股票代码")
+
+    if len(symbol_list) > 50:
+        raise HTTPException(status_code=400, detail="最多支持50只股票")
+
+    for sym in symbol_list:
+        if not re.match(r"^\d{6}$", sym):
+            raise HTTPException(
+                status_code=400,
+                detail=f"无效的股票代码格式: {sym}（需要6位数字）",
+            )
+
+    # --- Query 1: WatchlistAnalysis JOIN Watchlist ---
+    # Gets today's analysis counts per symbol.
+    # NOTE: WatchlistAnalysis has NO symbol column; must JOIN watchlist.
+    # NOTE: Use range query (created_at >= start AND created_at < end) instead of
+    #       func.date(created_at) == today to ensure index usage.
+    today = datetime.utcnow().date()
+    today_start = datetime.combine(today, datetime.min.time())
+    tomorrow_start = datetime.combine(today + timedelta(days=1), datetime.min.time())
+
+    wa_rows = (
+        db.query(
+            Watchlist.symbol,
+            func.sum(case((WatchlistAnalysis.analysis_type == "full", 1), else_=0)).label(
+                "full_count_today"
+            ),
+            func.count(WatchlistAnalysis.id).label("total_today"),
+            func.max(WatchlistAnalysis.created_at).label("last_analysis_at"),
+        )
+        .join(Watchlist, WatchlistAnalysis.watchlist_id == Watchlist.id)
+        .filter(
+            Watchlist.symbol.in_(symbol_list),
+            WatchlistAnalysis.created_at >= today_start,
+            WatchlistAnalysis.created_at < tomorrow_start,
+        )
+        .group_by(Watchlist.symbol)
+        .all()
+    )
+
+    # --- Query 2: AnalysisTask running status ---
+    # AnalysisTask HAS a symbol column, no JOIN needed.
+    one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+
+    at_rows = (
+        db.query(
+            AnalysisTask.symbol,
+            func.bool_or(AnalysisTask.status == "RUNNING").label("is_analyzing"),
+        )
+        .filter(
+            AnalysisTask.symbol.in_(symbol_list),
+            AnalysisTask.created_at >= one_hour_ago,
+        )
+        .group_by(AnalysisTask.symbol)
+        .all()
+    )
+
+    # --- Build response ---
+    result: Dict[str, Dict[str, Any]] = {}
+    for sym in symbol_list:
+        result[sym] = {
+            "is_analyzing": False,
+            "has_full_analysis_today": False,
+            "has_multiple_analyses": False,
+            "last_analysis_at": None,
+        }
+
+    for row in wa_rows:
+        entry = result.get(row.symbol)
+        if entry is not None:
+            entry["has_full_analysis_today"] = (row.full_count_today or 0) > 0
+            entry["has_multiple_analyses"] = (row.total_today or 0) >= 2
+            if row.last_analysis_at:
+                entry["last_analysis_at"] = row.last_analysis_at.isoformat()
+
+    for row in at_rows:
+        entry = result.get(row.symbol)
+        if entry is not None:
+            entry["is_analyzing"] = bool(row.is_analyzing)
+
+    return result
+
+
+# ============================================================================
 # Watchlist ID-based Endpoints (must be after static routes)
 # ============================================================================
 
@@ -754,12 +880,16 @@ async def incremental_analyze_precheck(
         raise HTTPException(status_code=404, detail="Watchlist entry not found")
 
     # Check full analysis exists today (matches IncrementalAnalysisService logic)
+    # NOTE: Use range query instead of func.date() to ensure index usage
     today = date.today()
+    today_start = datetime.combine(today, datetime.min.time())
+    tomorrow_start = datetime.combine(today + timedelta(days=1), datetime.min.time())
     full_today = db.query(WatchlistAnalysis).filter(
         WatchlistAnalysis.analysis_type == 'full',
         WatchlistAnalysis.completed_at.isnot(None),
         WatchlistAnalysis.error_message.is_(None),
-        func.date(WatchlistAnalysis.created_at) == today,
+        WatchlistAnalysis.created_at >= today_start,
+        WatchlistAnalysis.created_at < tomorrow_start,
     ).first()
 
     if not full_today:

@@ -55,33 +55,17 @@ def main():
     
     print(f"{BOLD}  Starting services...{RESET}\n")
     
-    # Start API server
-    print(f"{GREEN}[API]{RESET}  Starting FastAPI server on port 8000...")
+    # Start API server (with embedded worker)
+    print(f"{GREEN}[API+WORKER]{RESET} Starting FastAPI server on port 8002 (embedded worker)...")
+    api_env = os.environ.copy()
+    api_env["EMBEDDED_WORKER"] = "true"
     api_proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "webapi.server:app",
-         "--host", "0.0.0.0", "--port", "8000", "--reload"],
-        cwd=script_dir
+         "--host", "0.0.0.0", "--port", "8002", "--reload"],
+        cwd=script_dir,
+        env=api_env,
     )
     processes.append(api_proc)
-
-    # Start Workers
-    worker_count = int(os.getenv("WORKER_COUNT", "2"))
-    poll_interval = os.getenv("WORKER_POLL_INTERVAL", "1.0")
-    print(f"{GREEN}[WORKER]{RESET} Starting {worker_count} analysis workers (poll={poll_interval}s)...")
-    for i in range(worker_count):
-        worker_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "webapi.worker",
-                "--worker-id",
-                f"worker-{i+1}",
-                "--poll-interval",
-                poll_interval,
-            ],
-            cwd=script_dir
-        )
-        processes.append(worker_proc)
 
     # Start Web UI
     print(f"{GREEN}[WEB]{RESET}  Starting Streamlit on port 8501...\n")
@@ -94,10 +78,9 @@ def main():
     
     # Print URLs
     print(f"{BOLD}{'=' * 60}")
-    print(f"  {GREEN}API Server:{RESET}  http://localhost:8000")
-    print(f"  {GREEN}Docs:{RESET}       http://localhost:8000/docs")
+    print(f"  {GREEN}API Server:{RESET}  http://localhost:8002")
+    print(f"  {GREEN}Docs:{RESET}       http://localhost:8002/docs")
     print(f"  {GREEN}Web UI:{RESET}     http://localhost:8501")
-    print(f"  {GREEN}Workers:{RESET}    {worker_count} running")
     print(f"{'=' * 60}\n")
     
     print(f"{YELLOW}  Press Ctrl+C to stop all services{RESET}\n")

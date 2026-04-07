@@ -56,7 +56,7 @@ class WindowsNotifier:
             self._toaster = ToastNotifier()
             logger.info("[NOTIFICATION] Windows ToastNotifier initialized")
         except ImportError:
-            logger.warning("[NOTIFICATION] win10toast not installed. Install with: pip install win10toast")
+            logger.debug("[NOTIFICATION] win10toast not installed, desktop notifications disabled")
             self._toaster = None
 
     def send(self, title: str, message: str, duration: int = 10, **kwargs) -> bool:

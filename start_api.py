@@ -23,9 +23,9 @@ def main():
     print("\n" + "=" * 60)
     print("  TradingAgents API Server")
     print("=" * 60)
-    print("\n  API Server:  http://localhost:8000")
-    print("  Docs:       http://localhost:8000/docs")
-    print("  ReDoc:      http://localhost:8000/redoc")
+    print("\n  API Server:  http://localhost:8002")
+    print("  Docs:       http://localhost:8002/docs")
+    print("  ReDoc:      http://localhost:8002/redoc")
     print("\n  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
     
@@ -34,7 +34,7 @@ def main():
         sys.executable, "-m", "uvicorn",
         "webapi.server:app",
         "--host", "0.0.0.0",
-        "--port", "8001",
+        "--port", "8002",
         "--reload"
     ]
     

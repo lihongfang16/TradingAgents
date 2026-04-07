@@ -29,6 +29,29 @@ test_uvicorn*.py
 # Database files
 *.db
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Playwright MCP
+.playwright-mcp/
+
+# Session/plan files
+.sisyphus/notepads/
+.sisyphus/plans/
+.sisyphus/boulder.json
+
+# Temp scripts
+_start_services.bat
+cleanup_analyses.py
+_test_conn.py
+
 # Special files
 nul
 EOF

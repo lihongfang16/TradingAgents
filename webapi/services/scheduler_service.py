@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,16 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 
 def _normalize_signal(raw_signal: Any) -> str:
-    """Normalize signal payloads to a stable uppercase decision value."""
+    """Normalize signal payloads to a stable uppercase decision value.
+
+    Handles:
+    - Clean values: "BUY", "买入" → "BUY"
+    - Nested dicts with decision/signal keys
+    - Noisy LLM output containing <THINK> blocks or long reasoning —
+      extracts the trailing BUY/SELL/HOLD if present.
+    """
+    import re
+
     if isinstance(raw_signal, dict):
         raw_signal = raw_signal.get("decision") or raw_signal.get("signal")
 
@@ -45,14 +55,64 @@ def _normalize_signal(raw_signal: Any) -> str:
         return "UNKNOWN"
 
     normalized = str(raw_signal).strip().upper()
+
+    # Direct mapping for clean values
     mapping = {
         "买入": "BUY",
         "增持": "OVERWEIGHT",
         "持有": "HOLD",
         "减持": "UNDERWEIGHT",
         "卖出": "SELL",
+        "BUY": "BUY",
+        "SELL": "SELL",
+        "HOLD": "HOLD",
+        "OVERWEIGHT": "OVERWEIGHT",
+        "UNDERWEIGHT": "UNDERWEIGHT",
     }
-    return mapping.get(normalized, normalized or "UNKNOWN")
+
+    direct = mapping.get(normalized)
+    if direct:
+        return direct
+
+    # Fuzzy: check if a known decision word appears in the (possibly long) string
+    # Prefer longer matches ("OVERWEIGHT" before "BUY") to avoid false positives
+    for key in ("OVERWEIGHT", "UNDERWEIGHT", "BUY", "SELL", "HOLD"):
+        if key in normalized:
+            return key
+
+    return "UNKNOWN"
+
+
+def _extract_clean_signal(result: Any) -> str:
+    """Extract BUY/SELL/HOLD from noisy analyst output.
+    
+    Prefers result.decision over nested signal fields.
+    Handles Chinese-to-English mapping via _normalize_signal.
+    """
+    if not isinstance(result, dict):
+        return "UNKNOWN"
+    
+    # Priority 1: Direct decision field
+    decision = result.get("decision")
+    if decision:
+        return _normalize_signal(decision)
+    
+    # Priority 2: Nested signal.decision
+    signal = result.get("signal")
+    if isinstance(signal, dict):
+        nested_decision = signal.get("decision")
+        if nested_decision:
+            return _normalize_signal(nested_decision)
+        # Also try signal.signal for nested structure
+        nested_signal = signal.get("signal")
+        if nested_signal:
+            return _normalize_signal(nested_signal)
+    
+    # Priority 3: Direct signal string
+    if signal:
+        return _normalize_signal(signal)
+    
+    return "UNKNOWN"
 
 
 def _normalize_risk_level(raw_risk: Any) -> str:
@@ -78,7 +138,7 @@ def _extract_analysis_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     nested_result = result.get("result")
     payload = nested_result if isinstance(nested_result, dict) else result
 
-    signal = _normalize_signal(payload.get("signal") if isinstance(payload, dict) else result.get("signal"))
+    signal = _extract_clean_signal(payload if isinstance(payload, dict) else result)
     confidence = _to_float(
         payload.get("confidence") if isinstance(payload, dict) else result.get("confidence"),
         default=0.0,
@@ -236,6 +296,95 @@ def _schedule_high_frequency_window(watchlist: Any, duration_minutes: int = HIGH
     watchlist.high_freq_until = base_time + timedelta(minutes=duration_minutes)
 
 
+def reconcile_unfinalized_watchlist_analyses(db) -> List[Dict[str, Any]]:
+    """Find WA rows with completed_at IS NULL but linked AnalysisTask is COMPLETED.
+    
+    Uses FOR UPDATE SKIP LOCKED pattern for idempotency.
+    Actually finalizes the analyses by calling _finalize_watchlist_analysis.
+    
+    Returns:
+        List of dicts with reconciliation results
+    """
+    from webapi.models.database import WatchlistAnalysis, AnalysisTask
+    from datetime import datetime, timedelta
+    
+    reconciled = []
+    
+    # Only process analyses that are at least 5 minutes old
+    # (to avoid interfering with in-progress analyses)
+    min_age = datetime.utcnow() - timedelta(minutes=5)
+    
+    # Find orphaned rows with SKIP LOCKED
+    result = db.execute(
+        text("""
+            SELECT wa.id, wa.watchlist_id, at.result, at.task_id
+            FROM watchlist_analyses wa
+            JOIN analysis_tasks at ON at.task_id = wa.analysis_id
+            WHERE wa.completed_at IS NULL
+              AND at.status = 'COMPLETED'
+              AND at.completed_at IS NOT NULL
+              AND wa.created_at < :min_age
+            FOR UPDATE OF wa SKIP LOCKED
+        """),
+        {"min_age": min_age}
+    )
+    
+    rows = result.fetchall()
+    
+    for row in rows:
+        wa_id, watchlist_id, task_result, task_id = row
+        
+        # Re-fetch with lock to ensure idempotency
+        wa = db.query(WatchlistAnalysis).filter(
+            WatchlistAnalysis.id == wa_id,
+            WatchlistAnalysis.completed_at.is_(None)
+        ).with_for_update().first()
+        
+        if wa:
+            try:
+                # Actually finalize the analysis with the result data
+                _finalize_watchlist_analysis(db, wa, task_result or {})
+                reconciled.append({
+                    "wa_id": wa_id,
+                    "watchlist_id": watchlist_id,
+                    "task_id": task_id,
+                    "status": "finalized"
+                })
+                logger.info("[RECONCILE] Finalized WA %d for watchlist %d", wa_id, watchlist_id)
+            except Exception as e:
+                logger.exception("[RECONCILE] Failed to finalize WA %d: %s", wa_id, str(e))
+                reconciled.append({
+                    "wa_id": wa_id,
+                    "watchlist_id": watchlist_id,
+                    "task_id": task_id,
+                    "status": "error",
+                    "error": str(e)
+                })
+    
+    db.commit()
+    return reconciled
+
+
+def reconcile_expired_hf_flags(db) -> int:
+    """Reset is_high_frequency='N' where high_freq_until has passed."""
+    result = db.execute(
+        text("""
+            UPDATE watchlist
+            SET is_high_frequency = 'N',
+                high_freq_until = NULL
+            WHERE is_high_frequency = 'Y'
+              AND high_freq_until IS NOT NULL
+              AND high_freq_until < CURRENT_TIMESTAMP
+        """)
+    )
+
+    db.commit()
+    count = result.rowcount or 0
+    if count > 0:
+        logger.info("[RECONCILE] Reset %d expired high-frequency flags", count)
+    return count
+
+
 def _finalize_watchlist_analysis(
     db: Any,
     watchlist_analysis: Any,
@@ -285,7 +434,7 @@ def _finalize_watchlist_analysis(
     is_turning, reason, importance = detect_turning_point(current_result, previous_result, config) if detection_enabled and previous_result else (False, "无显著变化", 0.0)
 
     watchlist_analysis.completed_at = now
-    watchlist_analysis.signal = payload["signal"]
+    watchlist_analysis.signal = payload["signal"][:20] if payload["signal"] and len(payload["signal"]) <= 20 else payload["signal"][:17] + "..." if payload["signal"] else None
     watchlist_analysis.confidence = str(payload["confidence"]) if payload["confidence"] or payload["confidence"] == 0 else None
     watchlist_analysis.risk_level = payload["risk_level"]
     watchlist_analysis.price = payload["price"] if payload["price"] is not None else watchlist_analysis.price
@@ -295,11 +444,17 @@ def _finalize_watchlist_analysis(
     watchlist_analysis.importance_score = str(importance) if is_turning else None
 
     watchlist.last_analysis_at = now
-    watchlist.last_signal = payload["signal"]
+    watchlist.last_signal = payload["signal"][:20] if payload["signal"] and len(payload["signal"]) <= 20 else payload["signal"][:17] + "..." if payload["signal"] else None
     watchlist.last_confidence = str(payload["confidence"]) if payload["confidence"] or payload["confidence"] == 0 else None
     watchlist.last_risk_level = payload["risk_level"]
     if payload["price"] is not None:
-        watchlist.last_price = str(payload["price"])
+        current_price = _to_float(payload["price"], default=0.0)
+        # Calculate change percentage from previous price (before overwrite)
+        prev_price = _to_float(watchlist.last_price, default=0.0) if watchlist.last_price else 0.0
+        watchlist.last_price = str(current_price)
+        if prev_price > 0 and current_price > 0:
+            change_pct = (current_price - prev_price) / prev_price * 100
+            watchlist.last_change_pct = str(round(change_pct, 2))
 
     if is_turning:
         _schedule_high_frequency_window(watchlist)
@@ -318,183 +473,92 @@ def _finalize_watchlist_analysis(
         watchlist_analysis.alert_sent_at = watchlist_analysis.alert_sent_at
 
     return {
-        "watchlist_id": watchlist.id,
         "symbol": watchlist.symbol,
+        "analysis_id": watchlist_analysis.id,
         "is_turning": is_turning,
-        "reason": reason,
+        "turning_reason": reason,
         "importance": importance,
-        "is_high_frequency": watchlist.is_high_frequency == "Y",
-        "high_freq_until": watchlist.high_freq_until.isoformat() if watchlist.high_freq_until else None,
+        "alert_sent": watchlist_analysis.alert_sent == "Y",
     }
 
 
-def process_watchlist_analysis_completion(
-    watchlist_analysis_id: int,
-    result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Finalize an existing watchlist analysis row after task completion."""
+def process_watchlist_analysis_completion(watchlist_analysis_id: int, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Public wrapper to finalize a watchlist analysis and update parent watchlist.
+    
+    This function is called by the API path (async callback) to complete analysis.
+    It creates its own database session and handles all cleanup.
+    
+    Args:
+        watchlist_analysis_id: The ID of the WatchlistAnalysis row to finalize
+        result: The analysis result dict from AnalysisTask
+        
+    Returns:
+        Dict with status and summary of what was updated
+    """
     from webapi.config.database import SessionLocal
     from webapi.models.database import WatchlistAnalysis
-
+    
     db = SessionLocal()
     try:
-        watchlist_analysis = db.query(WatchlistAnalysis).filter(WatchlistAnalysis.id == watchlist_analysis_id).first()
+        # Fetch the watchlist analysis
+        watchlist_analysis = db.query(WatchlistAnalysis).filter(
+            WatchlistAnalysis.id == watchlist_analysis_id
+        ).first()
+        
         if watchlist_analysis is None:
-            raise ValueError(f"WatchlistAnalysis {watchlist_analysis_id} not found")
-
+            logger.error("[PROCESS] WatchlistAnalysis %d not found", watchlist_analysis_id)
+            return {"status": "error", "error": f"WatchlistAnalysis {watchlist_analysis_id} not found"}
+        
+        # Call the internal finalizer with the session
         summary = _finalize_watchlist_analysis(db, watchlist_analysis, result)
+        
         db.commit()
-        return summary
-    except Exception:
+        logger.info("[PROCESS] Finalized watchlist analysis %d: %s", watchlist_analysis_id, summary)
+        return {"status": "success", "summary": summary}
+        
+    except Exception as e:
         db.rollback()
-        logger.exception("[SCHEDULER] Failed to finalize watchlist analysis %s", watchlist_analysis_id)
-        raise
+        logger.exception("[PROCESS] Failed to finalize watchlist analysis %d: %s", watchlist_analysis_id, str(e))
+        return {"status": "error", "error": str(e)}
     finally:
         db.close()
 
 
-def _build_analysis_request(symbol: str, *, is_quick: bool) -> Any:
-    """Create a standard analysis request for scheduled jobs."""
-    from webapi.models.analysis import AnalysisRequest, StockExchange
-
-    return AnalysisRequest(
-        symbol=symbol,
-        exchange=StockExchange.CN,
-        analysts=["market"] if is_quick else None,
-        is_quick=is_quick,
-    )
-
-
-def _create_watchlist_analysis_row(db: Any, watchlist: Any, *, analysis_id: str, analysis_type: str, triggered_by: str) -> Any:
-    """Create a persisted WatchlistAnalysis placeholder row."""
-    from webapi.models.database import WatchlistAnalysis
-
-    watchlist_analysis = WatchlistAnalysis(
-        watchlist_id=watchlist.id,
-        analysis_id=analysis_id,
-        analysis_type=analysis_type,
-        triggered_by=triggered_by,
-        created_at=datetime.utcnow(),
-    )
-    db.add(watchlist_analysis)
-    db.commit()
-    db.refresh(watchlist_analysis)
-    return watchlist_analysis
-
-
-def _run_watchlist_job_batch(
-    *,
-    analysis_type: str,
-    triggered_by: str,
-    is_quick: bool,
-    watchlists: Sequence[Any],
-    timeout: int,
-) -> List[Dict[str, Any]]:
-    """Run scheduled analysis for a batch of watchlist items."""
+def reconciliation_job() -> Dict[str, Any]:
+    """Periodic sweep for stale states across all layers."""
     from webapi.config.database import SessionLocal
-    from webapi.services.analysis_service import analysis_service
+    from webapi.services.queue_service import AnalysisQueueService
 
-    db = SessionLocal()
-    summaries: List[Dict[str, Any]] = []
-    try:
-        for watchlist in watchlists:
-            try:
-                request = _build_analysis_request(watchlist.symbol, is_quick=is_quick)
-                task = analysis_service.create_task(request)
-                watchlist_analysis = _create_watchlist_analysis_row(
-                    db,
-                    watchlist,
-                    analysis_id=task.task_id,
-                    analysis_type=analysis_type,
-                    triggered_by=triggered_by,
-                )
-                analysis_response = analysis_service.run_analysis_sync(
-                    task.task_id,
-                    request,
-                    timeout=timeout,
-                    is_quick=is_quick,
-                )
-                result_payload = analysis_response.result if analysis_response and analysis_response.result else {}
-                result_payload.setdefault("analysis_type", analysis_type)
-                summaries.append(process_watchlist_analysis_completion(watchlist_analysis.id, result_payload))
-            except Exception:
-                logger.exception("[SCHEDULER] Failed processing scheduled analysis for %s", watchlist.symbol)
-        return summaries
-    finally:
-        db.close()
-
-
-def full_analysis_job() -> List[Dict[str, Any]]:
-    """Run full overnight analysis across all active watchlist entries."""
-    logger.info("[SCHEDULER] Starting full analysis job")
-    from webapi.config.database import SessionLocal
-    from webapi.models.database import Watchlist
+    logger.info("[RECONCILE-JOB] Starting periodic reconciliation...")
 
     db = SessionLocal()
     try:
-        watchlists = db.query(Watchlist).filter(Watchlist.is_active == "Y").order_by(Watchlist.id.asc()).all()
+        # Queue layer
+        queue_service = AnalysisQueueService()
+        stale_queue = queue_service.reconcile_stale_queue_rows(db, 30)
+        orphaned_tasks = queue_service.reconcile_orphaned_task_states(db, 30)
+        pending_orphans = queue_service.reconcile_pending_orphans(db, 30)
+
+        # Watchlist layer
+        unfinalized = reconcile_unfinalized_watchlist_analyses(db)
+        expired_hf = reconcile_expired_hf_flags(db)
+
+        summary = {
+            "stale_queue_rows": stale_queue,
+            "orphaned_tasks": orphaned_tasks,
+            "pending_orphans": pending_orphans,
+            "unfinalized_analyses": len(unfinalized),
+            "expired_hf_flags": expired_hf,
+        }
+
+        logger.info("[RECONCILE-JOB] Complete: %s", summary)
+        return summary
+
+    except Exception:
+        logger.exception("[RECONCILE-JOB] Periodic reconciliation failed")
+        return {"error": "reconciliation failed"}
     finally:
         db.close()
-
-    if not watchlists:
-        logger.info("[SCHEDULER] No active watchlist stocks for full analysis")
-        return []
-    return _run_watchlist_job_batch(
-        analysis_type="full",
-        triggered_by="scheduled",
-        is_quick=False,
-        watchlists=watchlists,
-        timeout=600,
-    )
-
-
-def quick_analysis_job() -> List[Dict[str, Any]]:
-    """Run regular market-hours quick analysis for non-high-frequency items."""
-    logger.info("[SCHEDULER] Starting quick analysis job")
-    from webapi.config.database import SessionLocal
-    from webapi.models.database import Watchlist
-
-    db = SessionLocal()
-    try:
-        now = datetime.utcnow()
-        watchlists = (
-            db.query(Watchlist)
-            .filter(
-                Watchlist.is_active == "Y",
-                (Watchlist.is_high_frequency == "N") | (Watchlist.high_freq_until.is_(None)) | (Watchlist.high_freq_until <= now),
-            )
-            .order_by(Watchlist.id.asc())
-            .all()
-        )
-
-        expired_high_freq = (
-            db.query(Watchlist)
-            .filter(
-                Watchlist.is_active == "Y",
-                Watchlist.is_high_frequency == "Y",
-                Watchlist.high_freq_until.isnot(None),
-                Watchlist.high_freq_until <= now,
-            )
-            .all()
-        )
-        for watchlist in expired_high_freq:
-            watchlist.is_high_frequency = "N"
-            watchlist.high_freq_until = None
-        if expired_high_freq:
-            db.commit()
-    finally:
-        db.close()
-
-    if not watchlists:
-        logger.info("[SCHEDULER] No eligible watchlist stocks for regular quick analysis")
-        return []
-    return _run_watchlist_job_batch(
-        analysis_type="quick",
-        triggered_by="scheduled",
-        is_quick=True,
-        watchlists=watchlists,
-        timeout=300,
-    )
 
 
 def high_frequency_batch_job() -> List[Dict[str, Any]]:
@@ -568,6 +632,61 @@ def high_frequency_batch_job() -> List[Dict[str, Any]]:
         db.close()
 
     return summaries
+
+
+def full_analysis_job() -> None:
+    """Run full analysis on all active watchlist stocks.
+    
+    This is a placeholder - the actual implementation should:
+    1. Query all active watchlist entries
+    2. Submit full analysis tasks for each
+    3. Handle batching and rate limiting
+    """
+    logger.info("[SCHEDULER] Running full analysis job (placeholder)")
+    # TODO: Implement actual full analysis logic
+    pass
+
+
+def quick_analysis_job() -> None:
+    """Run quick market analysis on all active watchlist stocks.
+    
+    This is a placeholder - the actual implementation should:
+    1. Query all active watchlist entries
+    2. Submit quick market-only analysis tasks
+    3. Handle batching and rate limiting
+    """
+    logger.info("[SCHEDULER] Running quick analysis job (placeholder)")
+    # TODO: Implement actual quick analysis logic
+    pass
+
+
+def _run_watchlist_job_batch(
+    analysis_type: str,
+    triggered_by: str,
+    is_quick: bool,
+    watchlists: List[Any],
+    timeout: int = 180
+) -> List[Dict[str, Any]]:
+    """Run a batch of watchlist analyses.
+    
+    This is a placeholder - the actual implementation should:
+    1. Submit analysis tasks for each watchlist
+    2. Wait for completion with timeout
+    3. Collect and return results
+    
+    Args:
+        analysis_type: Type of analysis ('full', 'quick', 'turning')
+        triggered_by: Who triggered it ('scheduled', 'turning', 'manual')
+        is_quick: Whether to use quick mode
+        watchlists: List of Watchlist objects to analyze
+        timeout: Maximum time to wait in seconds
+        
+    Returns:
+        List of result summaries
+    """
+    logger.info("[SCHEDULER] Running batch job for %d watchlists (placeholder)", len(watchlists))
+    # TODO: Implement actual batch processing logic
+    return []
 
 
 class SchedulerService:
@@ -774,6 +893,16 @@ class SchedulerService:
             name="High Frequency Batch (Every 2 min)",
             replace_existing=True,
             max_instances=1,
+        )
+        # NEW: Periodic reconciliation job
+        self._scheduler.add_job(
+            reconciliation_job,
+            IntervalTrigger(minutes=5, timezone=TRADING_TIMEZONE),
+            id="watchlist_reconciliation",
+            name="Watchlist Reconciliation (Every 5 min)",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=timedelta(minutes=1),
         )
 
     def stop(self, persist: bool = True) -> None:

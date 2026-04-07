@@ -64,7 +64,7 @@ Write-Host "=== STEP 4: Verification ==="
 
 # Test API
 try {
-    $response = Invoke-WebRequest -Uri "http://localhost:8000/docs" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    $response = Invoke-WebRequest -Uri "http://localhost:8002/docs" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
     Write-Host "[API] Health check: $($response.StatusCode) OK"
 } catch {
     Write-Host "[API] Health check: FAILED - $_"

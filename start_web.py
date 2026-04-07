@@ -16,7 +16,7 @@ def main():
     print("  TradingAgents Web UI")
     print("=" * 60)
     print("\n  Web UI:     http://localhost:8501")
-    print("  API:        http://localhost:8000")
+    print("  API:        http://localhost:8002")
     print("\n  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
     

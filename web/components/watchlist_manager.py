@@ -16,7 +16,7 @@ import streamlit as st
 
 
 # API URL - use same default as app.py
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:8002")
 
 
 def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
@@ -592,8 +592,9 @@ def format_duration(seconds: int) -> str:
         return f"{hours}小时{mins}分"
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_watchlist() -> List[Dict[str, Any]]:
-    """Load watchlist from API."""
+    """Load watchlist from API. Cached for 30s to reduce rerun latency."""
     try:
         resp = requests.get(f"{API_URL}/api/v1/watchlist/", timeout=5)
         if resp.status_code == 200:
@@ -1311,8 +1312,9 @@ def show_error_banner(message: str, retry_key: str = "retry_btn") -> bool:
         return st.button("🔄 重试", key=retry_key, use_container_width=False)
 
 
+@st.cache_data(ttl=15)
 def get_scheduler_status() -> Optional[Dict]:
-    """Get scheduler status."""
+    """Get scheduler status (cached 15s)."""
     try:
         resp = requests.get(f"{API_URL}/api/v1/watchlist/scheduler/status", timeout=3)
         if resp.status_code == 200:
@@ -1403,6 +1405,84 @@ def resolve_stock_name(symbol: str) -> str:
     except Exception:
         pass
     return ""
+
+
+# ============================================================================
+# Batch API Client with Caching (N+1 Optimization)
+# ============================================================================
+
+_BATCH_STATUS_TTL = 5  # seconds
+
+
+def _get_cached_batch_status(symbols: List[str]) -> Optional[Dict]:
+    """Return cached batch status if still fresh, else None."""
+    cache_key = f"batch_status_{hash(','.join(sorted(symbols)))}"
+    entry = st.session_state.get(cache_key)
+    if entry is None:
+        return None
+    if time.time() - entry["ts"] > _BATCH_STATUS_TTL:
+        return None
+    return entry["data"]
+
+
+def _set_cached_batch_status(symbols: List[str], data: Dict) -> None:
+    """Store batch status in session_state with TTL."""
+    cache_key = f"batch_status_{hash(','.join(sorted(symbols)))}"
+    st.session_state[cache_key] = {"data": data, "ts": time.time()}
+
+
+def invalidate_batch_status_cache(symbols: Optional[List[str]] = None) -> None:
+    """Invalidate batch status cache. If symbols is None, clear all."""
+    if symbols:
+        cache_key = f"batch_status_{hash(','.join(sorted(symbols)))}"
+        st.session_state.pop(cache_key, None)
+    else:
+        for key in list(st.session_state.keys()):
+            if key.startswith("batch_status_"):
+                del st.session_state[key]
+
+
+def fetch_watchlist_status_batch(symbols: List[str]) -> Dict[str, Dict]:
+    """Fetch analysis status for multiple symbols via batch API.
+
+    Uses 5-second client-side cache and auto-chunks >50 symbols.
+
+    Args:
+        symbols: List of 6-digit A-share codes.
+
+    Returns:
+        Dict mapping symbol -> {is_analyzing, has_full_analysis_today,
+        has_multiple_analyses, last_analysis_at}
+    """
+    if not symbols:
+        return {}
+
+    # Check cache
+    cached = _get_cached_batch_status(symbols)
+    if cached is not None:
+        return cached
+
+    # Auto-chunk for >50 symbols
+    MAX_CHUNK = 50
+    if len(symbols) > MAX_CHUNK:
+        merged: Dict[str, Dict] = {}
+        for i in range(0, len(symbols), MAX_CHUNK):
+            merged.update(fetch_watchlist_status_batch(symbols[i : i + MAX_CHUNK]))
+        return merged
+
+    try:
+        resp = requests.get(
+            f"{API_URL}/api/v1/watchlist/analysis-status",
+            params={"symbols": ",".join(symbols)},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            _set_cached_batch_status(symbols, data)
+            return data
+        return {}
+    except Exception:
+        return {}
 
 
 def _has_full_analysis_today(symbol: str) -> bool:
@@ -1633,8 +1713,8 @@ def render_add_stock_section():
                 if result:
                     display = f"{result.get('symbol', search_symbol)} {final_name}" if final_name else result.get('symbol', search_symbol)
                     st.success(f"已添加: {display}")
-                    st.session_state.watchlist_data = load_watchlist()
-                    # Clear caches
+                    # Clear caches to force fresh data on rerun
+                    load_watchlist.clear()
                     cache_key = f"_resolved_name_{search_symbol.strip()}"
                     st.session_state.pop(cache_key, None)
                     st.session_state.pop("watchlist_name", None)
@@ -1693,15 +1773,18 @@ def render_watchlist_table():
     st.subheader("📋 自选股列表")
     st.caption("每5分钟AI分析，变盘时2分钟高频")
     
-    # Load watchlist data
-    if 'watchlist_data' not in st.session_state:
-        st.session_state.watchlist_data = load_watchlist()
-    
-    watchlist = st.session_state.watchlist_data
+    # Load watchlist data (always fresh from cache)
+    watchlist = load_watchlist()
     
     if not watchlist:
         st.info("暂无自选股，请添加股票开始监控")
         return
+
+    # N+1优化: 批量获取所有股票的分析状态（替代逐只查询）
+    all_symbols = [item.get("symbol") for item in watchlist if item.get("symbol")]
+    status_batch: Dict[str, Dict] = {}
+    if all_symbols:
+        status_batch = fetch_watchlist_status_batch(all_symbols)
     
     # Table header
     header_cols = st.columns([1.2, 1.5, 1, 1, 2, 1.5, 1, 1, 1.2])
@@ -1817,10 +1900,16 @@ def render_watchlist_table():
             )
             btn_cols = st.columns([0.7, 0.7, 0.7])
 
-            # Compute button states
-            is_analyzing = _is_analysis_running(symbol)
-            has_full_today = _has_full_analysis_today(symbol)
-            has_multiple = _has_multiple_analyses_today(symbol)
+            # Compute button states (N+1优化: 使用批量查询结果)
+            _sym_status = status_batch.get(symbol, {})
+            is_analyzing = _sym_status.get("is_analyzing", False)
+            has_full_today = _sym_status.get("has_full_analysis_today", False)
+            has_multiple = _sym_status.get("has_multiple_analyses", False)
+
+            # 乐观更新: 如果用户刚触发了分析，立即显示为running
+            optimistic = st.session_state.get("optimistic_analysis_state", {}).get(symbol)
+            if optimistic == "running":
+                is_analyzing = True
 
             full_disabled = is_analyzing
             incr_disabled = not has_full_today or is_analyzing
@@ -1836,11 +1925,22 @@ def render_watchlist_table():
                     )
                 else:
                     if st.button("全量", key=f"full_btn_{stock_id}", help="启动全量分析"):
-                        with st.spinner("全量分析中..."):
-                            result = trigger_full_analysis(symbol, force_refresh=force_refresh)
-                        if result:
-                            st.success("全量分析已启动")
-                            st.rerun()
+                        # 乐观更新: 立即标记为running
+                        st.session_state.setdefault("optimistic_analysis_state", {})[symbol] = "running"
+                        try:
+                            with st.spinner("全量分析中..."):
+                                result = trigger_full_analysis(symbol, force_refresh=force_refresh)
+                            if result:
+                                st.success("全量分析已启动")
+                                invalidate_batch_status_cache([symbol])
+                                st.rerun()
+                            else:
+                                st.session_state.get("optimistic_analysis_state", {}).pop(symbol, None)
+                                st.error("分析启动失败")
+                                st.rerun()
+                        except Exception as e:
+                            st.session_state.get("optimistic_analysis_state", {}).pop(symbol, None)
+                            st.error(f"分析启动失败: {str(e)}")
 
             with btn_cols[1]:
                 incr_help = "需先完成今日全量分析" if not has_full_today else ("分析正在运行中" if is_analyzing else "启动增量分析")
@@ -1886,13 +1986,13 @@ def render_watchlist_table():
                         if st.button("✅ 确定", key=f"confirm_yes_{stock_id}"):
                             if delete_watchlist_stock(stock_id):
                                 st.session_state[confirm_key] = False
+                                # Optimistic update: immediately remove from cache & local state
+                                load_watchlist.clear()
                                 st.toast(f"✅ 已删除 {symbol}", icon="🗑️")
-                                # Refresh immediately after successful deletion
                                 st.rerun()
                     with col_no:
                         if st.button("❌ 取消", key=f"confirm_no_{stock_id}"):
                             st.session_state[confirm_key] = False
-                            st.rerun()
         
         if is_turning or importance_high:
             st.markdown("</div>", unsafe_allow_html=True)
@@ -2005,52 +2105,65 @@ def render_monitoring_panel():
 
     # Multi-stock charts section
     st.subheader("📊 多股价格对比")
+    # 显式加载控制: 避免无条件加载所有K线图
+    chart_load_col1, chart_load_col2 = st.columns([1, 3])
+    with chart_load_col1:
+        if st.button("📈 加载K线图表", key="load_charts_btn"):
+            st.session_state.load_monitoring_charts = True
+    with chart_load_col2:
+        if st.session_state.get("load_monitoring_charts"):
+            st.caption("✅ 图表已加载")
+        else:
+            st.caption("👆 点击左侧按钮加载图表数据（减少初始加载时间）")
     selected_ids = st.session_state.monitoring_selected_stocks
 
     # Filter watchlist to get selected stocks
     selected_stocks = [item for item in watchlist if item['id'] in selected_ids]
 
-    # Display charts in rows of 2 (larger charts = better resolution)
-    for i in range(0, len(selected_stocks), 2):
-        row_stocks = selected_stocks[i:i+2]
-        cols = st.columns(2)
-        for idx, stock in enumerate(row_stocks):
-            with cols[idx]:
-                symbol = stock['symbol']
-                name = stock.get('name', symbol)
-                st.write(f"**{symbol} {name}**")
+    if st.session_state.get("load_monitoring_charts"):
+        # Display charts in rows of 2 (larger charts = better resolution)
+        for i in range(0, len(selected_stocks), 2):
+            row_stocks = selected_stocks[i:i+2]
+            cols = st.columns(2)
+            for idx, stock in enumerate(row_stocks):
+                with cols[idx]:
+                    symbol = stock['symbol']
+                    name = stock.get('name', symbol)
+                    st.write(f"**{symbol} {name}**")
 
-                # Fetch and display chart with analysis overlay
-                df = get_stock_intraday_data(symbol)
-                if df is not None and not df.empty:
-                    # Fetch analysis history for this stock
-                    stock_id = stock.get('id')
-                    analysis_data = None
-                    if stock_id:
-                        with st.spinner("加载分析数据中..."):
-                            analysis_data = fetch_analysis_history(stock_id)
-                        if analysis_data is None:
-                            # Show error banner with retry option
-                            if show_error_banner(
-                                "⚠️ 分析数据获取失败",
-                                retry_key=f"retry_monitor_{stock_id}",
-                            ):
-                                st.session_state.pop(
-                                    f"analysis_history_{stock_id}", None
-                                )
-                                st.rerun()
-                            # Fall back to stale cache if available
-                            if f"analysis_history_{stock_id}" in st.session_state:
-                                analysis_data = st.session_state[f"analysis_history_{stock_id}"]
+                    # Fetch and display chart with analysis overlay
+                    df = get_stock_intraday_data(symbol)
+                    if df is not None and not df.empty:
+                        # Fetch analysis history for this stock
+                        stock_id = stock.get('id')
+                        analysis_data = None
+                        if stock_id:
+                            with st.spinner("加载分析数据中..."):
+                                analysis_data = fetch_analysis_history(stock_id)
+                            if analysis_data is None:
+                                # Show error banner with retry option
+                                if show_error_banner(
+                                    "⚠️ 分析数据获取失败",
+                                    retry_key=f"retry_monitor_{stock_id}",
+                                ):
+                                    st.session_state.pop(
+                                        f"analysis_history_{stock_id}", None
+                                    )
+                                    st.rerun()
+                                # Fall back to stale cache if available
+                                if f"analysis_history_{stock_id}" in st.session_state:
+                                    analysis_data = st.session_state[f"analysis_history_{stock_id}"]
 
-                    clicked = render_candlestick_chart(df, analysis_data=analysis_data, height=350, chart_key=f"monitor_chart_{stock_id}")
-                    # If a signal marker was clicked, open detail modal for this stock
-                    if clicked and stock_id:
-                        st.session_state.selected_stock = stock
-                        st.session_state.show_stock_detail = True
-                        st.rerun()
-                else:
-                    st.caption("暂无数据")
+                        clicked = render_candlestick_chart(df, analysis_data=analysis_data, height=350, chart_key=f"monitor_chart_{stock_id}")
+                        # If a signal marker was clicked, open detail modal for this stock
+                        if clicked and stock_id:
+                            st.session_state.selected_stock = stock
+                            st.session_state.show_stock_detail = True
+                            st.rerun()
+                    else:
+                        st.caption("暂无数据")
+    else:
+        st.info("👆 点击上方「加载K线图表」按钮查看详细走势")
 
     st.divider()
 
@@ -2323,58 +2436,100 @@ def render_stock_detail_modal():
                     else:
                         st.caption("暂无价格数据")
 
-                    # Show analysis history table
+                    # Show analysis history table - only show selected record
                     if analysis_data:
-                        st.write("**历史信号记录**")
+                        st.write("**历史信号详情**")
 
-                        # Determine which record to highlight (if any)
+                        # Get selected signal
                         clicked_signal = st.session_state.get('selected_signal')
-                        highlight_ts = ""
+                        
                         if clicked_signal and clicked_signal.get('timestamp'):
-                            highlight_ts = clicked_signal['timestamp']
+                            # Only display the selected record
+                            selected_ts = clicked_signal['timestamp']
+                            selected_rec = None
+                            for rec in analysis_data:
+                                if rec.get("timestamp") == selected_ts:
+                                    selected_rec = rec
+                                    break
+                            
+                            if selected_rec:
+                                ts = selected_rec.get("timestamp", "")
+                                sig = selected_rec.get("signal", "UNKNOWN")
+                                conf = selected_rec.get("confidence", 0)
+                                price = selected_rec.get("price")
+                                err = selected_rec.get("error_message")
+                                sig_color = get_signal_color(sig)
+                                
+                                time_str = ""
+                                if ts:
+                                    try:
+                                        dt = datetime.fromisoformat(
+                                            ts.replace('Z', '+00:00')
+                                        )
+                                        time_str = dt.strftime("%m/%d %H:%M")
+                                    except Exception:
+                                        time_str = ts[:16]
 
-                        for rec in analysis_data[:10]:
-                            ts = rec.get("timestamp", "")
-                            sig = rec.get("signal", "UNKNOWN")
-                            conf = rec.get("confidence", 0)
-                            price = rec.get("price")
-                            err = rec.get("error_message")
-                            sig_color = get_signal_color(sig)
-                            time_str = ""
-                            if ts:
-                                try:
-                                    dt = datetime.fromisoformat(
-                                        ts.replace('Z', '+00:00')
+                                # Display selected record with highlight
+                                border = "border:2px solid #2196F3;border-radius:6px;padding:10px;background:rgba(33,150,243,0.06);margin:8px 0"
+
+                                if err:
+                                    st.markdown(
+                                        f"<div style='{border}'><span style='color:#F44336'>"
+                                        f"❌ {time_str} 分析失败: {err}</span></div>",
+                                        unsafe_allow_html=True,
                                     )
-                                    time_str = dt.strftime("%m/%d %H:%M")
-                                except Exception:
-                                    time_str = ts[:16]
-
-                            # Highlight the record matching the clicked signal
-                            is_highlighted = highlight_ts and ts and highlight_ts == ts
-                            if is_highlighted:
-                                border = "border:2px solid #2196F3;border-radius:6px;padding:6px 10px;background:rgba(33,150,243,0.06);margin:4px 0"
+                                else:
+                                    price_str = (
+                                        f"¥{price:.2f}" if price else "--"
+                                    )
+                                    st.markdown(
+                                        f"<div style='{border}'><span style='color:{sig_color}'>"
+                                        f"📌 {time_str} "
+                                        f"{format_signal(sig, conf)} "
+                                        f"@ {price_str}</span></div>",
+                                        unsafe_allow_html=True,
+                                    )
+                                
+                                # Show back button to view all history
+                                if st.button("← 查看全部历史记录", key="view_all_history"):
+                                    st.session_state.selected_signal = None
+                                    st.rerun()
                             else:
-                                border = ""
+                                st.caption("选中的记录不存在")
+                                if st.button("← 查看全部历史记录", key="view_all_history_invalid"):
+                                    st.session_state.selected_signal = None
+                                    st.rerun()
+                        else:
+                            # No signal selected, show list for selection
+                            st.caption("点击K线图表上的信号点查看详情，或选择下方记录：")
+                            
+                            for rec in analysis_data[:5]:
+                                ts = rec.get("timestamp", "")
+                                sig = rec.get("signal", "UNKNOWN")
+                                conf = rec.get("confidence", 0)
+                                price = rec.get("price")
+                                err = rec.get("error_message")
+                                sig_color = get_signal_color(sig)
+                                time_str = ""
+                                if ts:
+                                    try:
+                                        dt = datetime.fromisoformat(
+                                            ts.replace('Z', '+00:00')
+                                        )
+                                        time_str = dt.strftime("%m/%d %H:%M")
+                                    except Exception:
+                                        time_str = ts[:16]
 
-                            if err:
-                                st.markdown(
-                                    f"<div style='{border}'><span style='color:#F44336'>"
-                                    f"❌ {time_str} 分析失败: {err}</span></div>",
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                price_str = (
-                                    f"¥{price:.2f}" if price else "--"
-                                )
-                                prefix = "📌 " if is_highlighted else ""
-                                st.markdown(
-                                    f"<div style='{border}'><span style='color:{sig_color}'>"
-                                    f"{prefix}{time_str} "
-                                    f"{format_signal(sig, conf)} "
-                                    f"@ {price_str}</span></div>",
-                                    unsafe_allow_html=True,
-                                )
+                                if err:
+                                    btn_label = f"❌ {time_str} 分析失败"
+                                else:
+                                    price_str = f"¥{price:.2f}" if price else "--"
+                                    btn_label = f"{time_str} {format_signal(sig, conf)} @ {price_str}"
+                                
+                                if st.button(btn_label, key=f"select_signal_{ts}"):
+                                    st.session_state.selected_signal = rec
+                                    st.rerun()
                     else:
                         st.caption("尚无AI信号，请先运行分析")
             else:
@@ -2660,7 +2815,7 @@ def render_watchlist_manager():
         # --- Auto-refresh logic ---
         if st.session_state.get('auto_refresh', True):
             # Use a shorter delay and incremental refresh
-            time.sleep(10)  # Refresh every 10 seconds
+            time.sleep(30)  # Refresh every 30 seconds
             st.session_state.refresh_alerts = True
             # Update last refresh timestamp
             st.session_state.watchlist_last_update = datetime.utcnow().strftime("%H:%M:%S")

@@ -18,7 +18,7 @@ from web.components.history_manager import render_history_manager, render_histor
 from web.components.watchlist_manager import render_watchlist_manager
 
 # API配置
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8002")
 
 
 def poll_for_result(task_id: str, api_url: str, max_attempts: int = 60, sleep_seconds: int = 2) -> Optional[dict[str, Any]]:
@@ -109,16 +109,16 @@ def main():
         return
     
     if st.session_state.current_view == "history":
-        selected_task_id = render_history_manager()
-        if selected_task_id:
-            st.session_state.current_view = "history_detail"
-            st.session_state.selected_task_id = selected_task_id
-            st.rerun()
-        return
-    
-    if st.session_state.current_view == "history_detail":
         if st.session_state.selected_task_id:
             render_history_detail(st.session_state.selected_task_id)
+            if st.button("← 返回列表", key="back_to_history_list"):
+                st.session_state.selected_task_id = None
+                st.rerun()
+        else:
+            selected_task_id = render_history_manager()
+            if selected_task_id:
+                st.session_state.selected_task_id = selected_task_id
+                st.rerun()
         return
     
     # current_view == "analysis" 时，渲染分析表单

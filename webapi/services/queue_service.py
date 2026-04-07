@@ -192,6 +192,92 @@ class AnalysisQueueService:
         finally:
             db.close()
 
+    def reconcile_stale_queue_rows(self, db, stale_timeout_minutes: int = 30) -> int:
+        """Reset PROCESSING rows with started_at > timeout to QUEUED."""
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=stale_timeout_minutes)
+
+        result = db.execute(
+            text("""
+                UPDATE analysis_queue
+                SET status = 'QUEUED',
+                    retry_count = retry_count + 1,
+                    worker_id = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error_message = 'Worker timeout - task reset by reconciliation'
+                WHERE status = 'PROCESSING'
+                  AND started_at IS NOT NULL
+                  AND started_at < :stale_cutoff
+            """),
+            {"stale_cutoff": stale_cutoff}
+        )
+
+        db.commit()
+        count = result.rowcount or 0
+        if count > 0:
+            logger.info("[RECONCILE] Reset %d stale PROCESSING queue rows to QUEUED", count)
+        return count
+
+    def reconcile_orphaned_task_states(self, db, stale_timeout_minutes: int = 30) -> int:
+        """Mark RUNNING AnalysisTasks as FAILED when queue row is not PROCESSING."""
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=stale_timeout_minutes)
+
+        result = db.execute(
+            text("""
+                UPDATE analysis_tasks
+                SET status = 'FAILED',
+                    error = 'Orphaned task - no active queue entry',
+                    updated_at = CURRENT_TIMESTAMP,
+                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+                WHERE status = 'RUNNING'
+                  AND updated_at < :stale_cutoff
+                  AND task_id NOT IN (
+                      SELECT task_id
+                      FROM analysis_queue
+                      WHERE status = 'PROCESSING'
+                  )
+            """),
+            {"stale_cutoff": stale_cutoff}
+        )
+
+        db.commit()
+        count = result.rowcount or 0
+        if count > 0:
+            logger.info("[RECONCILE] Marked %d orphaned RUNNING tasks as FAILED", count)
+        return count
+
+    def reconcile_pending_orphans(self, db, stale_timeout_minutes: int = 30) -> int:
+        """Mark PENDING AnalysisTasks as FAILED when they have no queue entry at all.
+
+        This catches tasks that were created (committed to analysis_tasks) but
+        whose subsequent ``enqueue()`` call failed silently, leaving them as
+        orphan PENDING rows with no matching analysis_queue row.
+        """
+        stale_cutoff = datetime.utcnow() - timedelta(minutes=stale_timeout_minutes)
+
+        result = db.execute(
+            text("""
+                UPDATE analysis_tasks
+                SET status = 'FAILED',
+                    error = 'Orphaned PENDING task - no queue entry ever created',
+                    updated_at = CURRENT_TIMESTAMP,
+                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+                WHERE status = 'PENDING'
+                  AND created_at < :stale_cutoff
+                  AND task_id NOT IN (
+                      SELECT task_id
+                      FROM analysis_queue
+                  )
+            """),
+            {"stale_cutoff": stale_cutoff}
+        )
+
+        db.commit()
+        count = result.rowcount or 0
+        if count > 0:
+            logger.info("[RECONCILE] Marked %d orphaned PENDING tasks as FAILED", count)
+        return count
+
     def get_queue_stats(self) -> Dict[str, Any]:
         """Return counts and simple latency visibility for queue monitoring."""
         db = SessionLocal()

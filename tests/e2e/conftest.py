@@ -13,8 +13,9 @@ import requests
 # Environment / URL configuration
 # ---------------------------------------------------------------------------
 # Both API and Web UI should run on localhost for E2E tests
-TEST_API_URL = os.getenv("TEST_API_URL", "http://localhost:8000")
-TEST_WEB_URL = os.getenv("TEST_WEB_URL", "http://localhost:8501")
+# NOTE: Use 127.0.0.1 instead of localhost to avoid Windows IPv6 resolution delay
+TEST_API_URL = os.getenv("TEST_API_URL", "http://127.0.0.1:8000")
+TEST_WEB_URL = os.getenv("TEST_WEB_URL", "http://127.0.0.1:8501")
 
 
 @pytest.fixture(scope="session")

@@ -15,7 +15,7 @@ Steps:
 
 import logging
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -88,12 +88,16 @@ class IncrementalAnalysisService:
             options = {}
 
         # ── Step 1: Check for full analysis today ─────────────────────
+        # NOTE: Use range query instead of func.date() to ensure index usage
         today = date.today()
+        today_start = datetime.combine(today, datetime.min.time())
+        tomorrow_start = datetime.combine(today + timedelta(days=1), datetime.min.time())
         full_today = self.db.query(WatchlistAnalysis).filter(
             WatchlistAnalysis.analysis_type == 'full',
             WatchlistAnalysis.completed_at.isnot(None),
             WatchlistAnalysis.error_message.is_(None),
-            func.date(WatchlistAnalysis.created_at) == today,
+            WatchlistAnalysis.created_at >= today_start,
+            WatchlistAnalysis.created_at < tomorrow_start,
         ).first()
 
         if not full_today:

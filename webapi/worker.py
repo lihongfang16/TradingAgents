@@ -34,6 +34,8 @@ if platform.system() == "Windows":
     import asyncio
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+from sqlalchemy import text
+
 from webapi.services.queue_service import AnalysisQueueService
 from webapi.config.database import SessionLocal
 from webapi.models.analysis import AnalysisStatus
@@ -115,7 +117,11 @@ class AnalysisWorker:
     def _process_task(self, task_id: str):
         """
         Process a single task by spawning a subprocess.
-        
+
+        A ``finally`` safety-net guarantees that the task will never be left
+        in RUNNING status when this method returns, regardless of how the
+        subprocess exits (success, exception, SIGKILL, timeout).
+
         Args:
             task_id: The task ID to process
         """
@@ -130,20 +136,26 @@ class AnalysisWorker:
                 ],
             )
             self.current_process = proc
-            
+
             # Wait for completion with timeout
             proc.wait(timeout=self.task_timeout)
-            
+
             if proc.returncode != 0:
-                # Subprocess already updated queue status and AnalysisTask
+                # Idempotent: only updates if task is still RUNNING.
+                # Covers SIGKILL / crash where subprocess couldn't update DB.
                 logger.error(f"Task {task_id} failed with exit code {proc.returncode}")
+                self._mark_analysis_task_failed_if_running(
+                    task_id, f"Process exited with code {proc.returncode}"
+                )
+                self.queue_service.mark_failed(
+                    task_id, f"Process exited with code {proc.returncode}"
+                )
             else:
-                # Subprocess already updated queue status and AnalysisTask
                 logger.info(f"Task {task_id} completed successfully")
-                
+
         except subprocess.TimeoutExpired:
             logger.error(f"Task {task_id} timed out after {self.task_timeout}s")
-            
+
             # Kill the subprocess
             if self.current_process:
                 try:
@@ -151,15 +163,22 @@ class AnalysisWorker:
                     self.current_process.wait(timeout=5)
                 except Exception as e:
                     logger.warning(f"Failed to kill subprocess for task {task_id}: {e}")
-            
+
             # Mark as failed
             self.queue_service.mark_failed(task_id, f"Timeout after {self.task_timeout}s")
-            self._mark_analysis_task_failed(task_id, f"Timeout after {self.task_timeout}s")
-            
+            self._mark_analysis_task_failed_if_running(task_id, f"Timeout after {self.task_timeout}s")
+
         except Exception as e:
             logger.error(f"Error processing task {task_id}: {e}")
             self.queue_service.mark_failed(task_id, str(e))
-            self._mark_analysis_task_failed(task_id, str(e))
+            self._mark_analysis_task_failed_if_running(task_id, str(e))
+
+        finally:
+            # Safety-net: if the task is still RUNNING after all handlers,
+            # something unexpected happened — mark it FAILED to prevent zombies.
+            self._mark_analysis_task_failed_if_running(
+                task_id, "Worker finished but task still RUNNING — forced fail"
+            )
     
     def stop(self):
         """Signal the worker to stop gracefully."""
@@ -180,21 +199,33 @@ class AnalysisWorker:
                 except:
                     pass
 
-    def _mark_analysis_task_failed(self, task_id: str, error_message: str) -> None:
-        """Keep task table aligned when worker-level failures happen."""
+    def _mark_analysis_task_failed_if_running(self, task_id: str, error_message: str) -> None:
+        """Idempotently mark a task as FAILED **only** if it is still RUNNING.
+
+        Uses ``WHERE status = 'RUNNING'`` to avoid overwriting a status that
+        the subprocess (or reconciliation) already finalised.
+        """
         db = SessionLocal()
         try:
-            task = db.query(AnalysisTask).filter(AnalysisTask.task_id == task_id).first()
-            if task is None:
-                return
-
             now = datetime.utcnow()
-            task.status = AnalysisStatus.FAILED.value
-            task.updated_at = now
-            task.completed_at = now
-            task.message = "Analysis failed in worker"
-            task.error = error_message
+            result = db.execute(
+                text(
+                    """
+                    UPDATE analysis_tasks
+                    SET status    = 'FAILED',
+                        updated_at = :now,
+                        completed_at = COALESCE(completed_at, :now),
+                        message   = 'Analysis failed in worker',
+                        error     = :error
+                    WHERE task_id = :task_id
+                      AND status  = 'RUNNING'
+                    """
+                ),
+                {"task_id": task_id, "now": now, "error": error_message},
+            )
             db.commit()
+            if result.rowcount > 0:
+                logger.info("Marked task %s as FAILED (was RUNNING): %s", task_id, error_message)
         except Exception:
             db.rollback()
             logger.exception("Failed to mark analysis task %s as failed", task_id)

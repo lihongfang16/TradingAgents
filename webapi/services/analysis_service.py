@@ -429,7 +429,11 @@ class AnalysisService:
         *,
         priority: int,
     ) -> AnalysisResponse:
-        """Ensure the task exists and is ready for worker pickup."""
+        """Ensure the task exists and is ready for worker pickup.
+
+        If enqueue fails the task is rolled back to FAILED so it never
+        becomes an orphan PENDING entry (no matching analysis_queue row).
+        """
         task_resp = self._ensure_task_record(task_id, request)
         self._update_task_status(
             task_id,
@@ -438,11 +442,25 @@ class AnalysisService:
             error=None,
         )
 
-        self.queue_service.enqueue(
-            task_id,
-            request.model_dump(mode="json"),
-            priority=priority,
-        )
+        try:
+            enqueued = self.queue_service.enqueue(
+                task_id,
+                request.model_dump(mode="json"),
+                priority=priority,
+            )
+            if not enqueued:
+                logger.warning(
+                    "Task %s enqueue returned False (already queued); treating as success",
+                    task_id,
+                )
+        except Exception:
+            logger.exception("Failed to enqueue task %s — marking as FAILED", task_id)
+            self._update_task_status(
+                task_id,
+                AnalysisStatus.FAILED.value,
+                error="Failed to enqueue task — queue persistence unavailable",
+            )
+            raise
 
         refreshed_task = self.get_task(task_id)
         return refreshed_task or task_resp

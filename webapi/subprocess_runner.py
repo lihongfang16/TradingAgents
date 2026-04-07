@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Subprocess entrypoint for analysis execution."""
 
+# Suppress noisy warnings that would pop up as Windows dialogs
+import warnings
+warnings.filterwarnings("ignore", message="urllib3.*doesn't match a supported version")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="tradingagents")
+
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportGeneralTypeIssues=false, reportMissingTypeArgument=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportDeprecated=false
 
 from dotenv import load_dotenv

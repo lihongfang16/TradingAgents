@@ -130,10 +130,10 @@ async def get_progress(task_id: str):
             return
 
         # Stream real-time progress using tracked fields
-        while task and str(task.status) in {AnalysisStatus.PENDING.value, AnalysisStatus.RUNNING.value}:
+        while task and task.status in {AnalysisStatus.PENDING, AnalysisStatus.RUNNING}:
             progress_data = {
                 "task_id": task_id,
-                "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+                "status": task.status.value,
                 "symbol": task.symbol,
                 "agents_progress": task.agents_progress or {},
                 "current_agent": task.current_agent or "",
@@ -161,7 +161,7 @@ async def get_progress(task_id: str):
         
         final_data = {
             "task_id": task_id,
-            "status": final_task.status.value if hasattr(final_task.status, 'value') else str(final_task.status),
+            "status": final_task.status.value,
             "symbol": final_task.symbol,
             "agents_progress": final_task.agents_progress or {},
             "current_agent": final_task.current_agent or "",
