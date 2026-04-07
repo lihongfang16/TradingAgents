@@ -57,7 +57,7 @@ class AnalysisWorker:
         worker_id: str, 
         poll_interval: float = 1.0,
         max_tasks: Optional[int] = None,
-        task_timeout: int = 600
+        task_timeout: Optional[int] = None
     ):
         """
         Initialize worker.
@@ -66,17 +66,43 @@ class AnalysisWorker:
             worker_id: Unique identifier for this worker
             poll_interval: Seconds between queue polls when empty
             max_tasks: Maximum tasks to process before exiting (None = infinite)
-            task_timeout: Maximum seconds to wait for a task to complete
+            task_timeout: Maximum seconds to wait for a task to complete.
+                         Priority: argument > env var > config default > 600
         """
         self.worker_id = worker_id
         self.poll_interval = poll_interval
         self.max_tasks = max_tasks
-        self.task_timeout = task_timeout
+        
+        # Determine task timeout: argument > env var > config default > 600
+        if task_timeout is not None:
+            # CLI argument takes highest priority
+            self.task_timeout = task_timeout
+        else:
+            # Try environment variable
+            env_timeout = os.getenv("WORKER_TASK_TIMEOUT")
+            if env_timeout:
+                try:
+                    self.task_timeout = int(env_timeout)
+                except ValueError:
+                    logger.warning(f"Invalid WORKER_TASK_TIMEOUT value: {env_timeout}, using default")
+                    self.task_timeout = self._get_default_timeout()
+            else:
+                # Fall back to config or default
+                self.task_timeout = self._get_default_timeout()
+        
         self.queue_service = AnalysisQueueService()
         self.running = False
         self.tasks_processed = 0
         self.current_task = None
         self.current_process = None
+    
+    def _get_default_timeout(self) -> int:
+        """Get default timeout from config or hardcoded default."""
+        try:
+            from tradingagents.default_config import DEFAULT_CONFIG
+            return DEFAULT_CONFIG.get("analysis_timeout_seconds", 600)
+        except Exception:
+            return 600
         
     def start(self):
         """Start the worker loop."""
