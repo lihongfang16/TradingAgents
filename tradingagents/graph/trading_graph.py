@@ -105,6 +105,12 @@ class TradingAgentsGraph:
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
         
+        # Wrap LLMs with timeout protection
+        from ..llm_clients.timeout_wrapper import TimeoutWrapper
+        timeout_seconds = self.config.get("llm_nodata_timeout_seconds", 120)
+        self.deep_thinking_llm = TimeoutWrapper(self.deep_thinking_llm, timeout_seconds)
+        self.quick_thinking_llm = TimeoutWrapper(self.quick_thinking_llm, timeout_seconds)
+        
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
         self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
@@ -148,6 +154,15 @@ class TradingAgentsGraph:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
         provider = str(self.config.get("llm_provider", "") or "").lower()
+
+        # Add timeout and max_retries if configured
+        timeout = self.config.get("llm_nodata_timeout_seconds")
+        if timeout:
+            kwargs["timeout"] = timeout
+        
+        max_retries = self.config.get("llm_max_retries")
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
