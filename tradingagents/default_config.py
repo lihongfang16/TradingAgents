@@ -23,6 +23,10 @@ DEFAULT_CONFIG = {
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 300,
+    # Timeout and retry configuration
+    "llm_nodata_timeout_seconds": 120,  # Timeout if no data received for 120s
+    "llm_max_retries": 2,                # LangChain max retries for API errors
+    "analysis_timeout_seconds": 900,     # Worker task timeout (15 minutes)
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {
