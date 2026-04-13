@@ -848,6 +848,15 @@ def render_history_detail(task_id: str):
         key_points = []
         reasoning = ""
 
+        # Try api_data top-level fields FIRST (DB-persisted correct values)
+        if api_data and isinstance(api_data, dict):
+            db_decision = api_data.get("decision")
+            db_confidence = api_data.get("confidence")
+            if db_decision and db_decision != "UNKNOWN":
+                decision = db_decision
+                if isinstance(db_confidence, (int, float)) and db_confidence > 0:
+                    confidence = db_confidence
+
         # Extract from final_state (TradingAgents result structure)
         if isinstance(final_state, dict):
             # Try to extract decision/recommendation from messages
@@ -869,13 +878,6 @@ def render_history_detail(task_id: str):
                     if "FINAL TRANSACTION PROPOSAL:" in content:
                         proposal_section = content.split("FINAL TRANSACTION PROPOSAL:")[-1].split("---")[0]
                         recommendation = proposal_section.strip()
-                    # Extract decision
-                    if "**BUY**" in content or "买入" in content:
-                        decision = "BUY"
-                    elif "**SELL**" in content or "卖出" in content:
-                        decision = "SELL"
-                    elif "**HOLD**" in content or "持有" in content:
-                        decision = "HOLD"
 
             # Get reports from final_state
             market_report = final_state.get("market_report", "")
@@ -892,11 +894,27 @@ def render_history_detail(task_id: str):
                 debate = final_state.get("investment_debate_state", {})
                 risk_level = debate.get("risk_assessment", "")
 
-        # Fallback to result_data fields
-        if isinstance(result_data, dict) and not recommendation:
-            recommendation = result_data.get("recommendation", "")
-            decision = result_data.get("decision", decision)
-            confidence = result_data.get("confidence", confidence)
+        # Fallback: use extract_decision_with_fallback for 5-tier + Chinese support
+        if decision == "UNKNOWN":
+            fallback_decision, fallback_conf = extract_decision_with_fallback(
+                result_data or raw_result
+            )
+            if fallback_decision and fallback_decision != "UNKNOWN":
+                decision = fallback_decision
+            if confidence == 0 and fallback_conf > 0:
+                # Display expects 0-100 range; fallback returns 0-1
+                confidence = fallback_conf * 100
+
+        # Fallback to result_data fields (only overwrite if still UNKNOWN/0)
+        if isinstance(result_data, dict):
+            recommendation = recommendation or result_data.get("recommendation", "")
+            if decision == "UNKNOWN":
+                decision = result_data.get("decision", decision)
+            if confidence == 0:
+                result_conf = result_data.get("confidence", 0)
+                if isinstance(result_conf, (int, float)) and result_conf > 0:
+                    # Display expects 0-100 range
+                    confidence = result_conf if result_conf > 1.0 else result_conf * 100
             risk_level = risk_level or result_data.get("risk_level", "")
             summary = summary or result_data.get("summary", "")
             key_points = result_data.get("key_points", key_points)
@@ -924,7 +942,14 @@ def render_history_detail(task_id: str):
         progress_pct = int(result_data.get("progress_pct", 0) or 0) if isinstance(result_data, dict) else 0
         progress_indeterminate = bool(result_data.get("is_progress_indeterminate")) if isinstance(result_data, dict) else False
 
-        st.header(f"📊 {symbol} 分析详情")
+        name = _get_stock_name(symbol)
+        if name:
+            st.markdown(
+                f"## 📊 {symbol} <span style='font-size:0.85rem;color:#6B7280;'>({name})</span> 分析详情",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.header(f"📊 {symbol} 分析详情")
         st.caption(f"📅 {date_str} | {status_icon} {status_text}")
 
         st.divider()

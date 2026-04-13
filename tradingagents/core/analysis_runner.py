@@ -405,8 +405,22 @@ class AnalysisRunner:
             if isinstance(failing_step, str) and failing_step and failing_step in agents_progress and failing_step != "error":
                 agents_progress[failing_step] = "failed"
 
+            # Structured error classification
+            error_type = self._classify_error(e)
+            structured_error = {
+                "type": error_type,
+                "message": str(e),
+                "agent": failing_step if failing_step else "unknown",
+                "timestamp": datetime.now().isoformat(),
+                "retry_count": result.get("retry_count", 0),
+                "llm_params": {
+                    "model": getattr(self, "current_model", None),
+                    "timeout": self.config.get("llm_nodata_timeout_seconds", 120),
+                }
+            }
+
             result["status"] = "error"
-            result["error"] = str(e)
+            result["error"] = structured_error
             result["current_agent"] = "error"
             result["agents_progress"] = agents_progress.copy()
             result["llm_streams"] = self._llm_streams.copy()
@@ -475,7 +489,10 @@ class AnalysisRunner:
                 # Truncate long reports for storage
                 if len(value) > self.REPORT_MAX_CHARS:
                     value = value[:self.REPORT_MAX_CHARS] + "\n...[已截断]"
-                self._llm_streams[step_id] = value
+                # Preserve existing content if it's more complete (real-time capture)
+                existing = self._llm_streams.get(step_id, "")
+                if not existing or len(value) > len(existing):
+                    self._llm_streams[step_id] = value
 
         # Extract debate state summaries if available
         for debate_key, debate_step_id in [
@@ -491,7 +508,10 @@ class AnalysisRunner:
                     if history and isinstance(history, str) and history.strip():
                         parts.append(f"### {history_key}\n{history[:self.REPORT_MAX_CHARS]}")
                 if parts:
-                    self._llm_streams[debate_step_id] = "\n\n".join(parts)
+                    new_value = "\n\n".join(parts)
+                    existing = self._llm_streams.get(debate_step_id, "")
+                    if not existing or len(new_value) > len(existing):
+                        self._llm_streams[debate_step_id] = new_value
 
     def _extract_structured_metrics(self, state: Any, signal: Any) -> Dict[str, Any]:
         """Extract structured confidence/risk metadata from final state."""
@@ -642,6 +662,53 @@ class AnalysisRunner:
                 slim_state[debate_key] = {"judge_decision": judge_decision}
 
         return slim_state
+
+    def _classify_error(self, exception: Exception) -> str:
+        """Classify error type for structured error reporting.
+        
+        Categorizes exceptions into well-defined error types for proper
+        handling and retry decisions at the queue level.
+        
+        Args:
+            exception: The caught exception
+            
+        Returns:
+            Error type string: llm_timeout, api_error, data_error, or unknown
+        """
+        exception_type = type(exception).__name__
+        exception_msg = str(exception).lower()
+        
+        # LLM Timeout errors from TimeoutWrapper
+        if isinstance(exception, TimeoutError):
+            return "llm_timeout"
+        
+        # Check for timeout-related keywords in message
+        if "timeout" in exception_msg or "timed out" in exception_msg:
+            return "llm_timeout"
+        
+        # API errors (rate limits, auth, connection)
+        if exception_type in [
+            "APIError", "APIConnectionError", "RateLimitError",
+            "AuthenticationError", "PermissionDeniedError",
+        ]:
+            return "api_error"
+        
+        # Check for common API error patterns
+        if any(keyword in exception_msg for keyword in [
+            "rate limit", "api key", "authentication", "unauthorized",
+            "forbidden", "connection error", "bad gateway", "service unavailable"
+        ]):
+            return "api_error"
+        
+        # Data errors (missing data, invalid symbols, etc.)
+        if any(keyword in exception_msg for keyword in [
+            "no data", "data not found", "invalid symbol", "symbol not found",
+            "data error", "fetch failed", "unable to retrieve"
+        ]):
+            return "data_error"
+        
+        # Default to unknown for unclassified errors
+        return "unknown"
 
     def _serialize_state(self, state: Any, max_depth: int = SERIALIZE_MAX_DEPTH) -> Dict[str, Any]:
         """
