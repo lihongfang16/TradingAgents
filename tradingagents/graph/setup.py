@@ -41,7 +41,7 @@ class GraphSetup:
 
     def setup_graph(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=["market_index", "market", "social", "news", "fundamentals"],
         fast_mode: bool = False,
     ):
         """Set up and compile the agent workflow graph.

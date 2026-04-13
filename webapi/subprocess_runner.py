@@ -33,6 +33,7 @@ from webapi.config.database import SessionLocal
 from webapi.models.analysis import AnalysisRequest, AnalysisStatus, StockExchange
 from webapi.models.database import AnalysisTask
 from webapi.services.queue_service import AnalysisQueueService
+from webapi.utils.signal_extractor import normalize_signal
 
 logger = logging.getLogger(__name__)
 queue_service = AnalysisQueueService()
@@ -111,19 +112,13 @@ def _resolve_runner_config(request: AnalysisRequest) -> Dict[str, Optional[str]]
 
 
 def _extract_decision(signal: Any) -> Optional[str]:
-    """Extract normalized decision text from the signal payload."""
-    if isinstance(signal, dict):
-        return signal.get("decision") or signal.get("signal")
-
-    if isinstance(signal, str):
-        valid = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
-        for word in reversed(signal.strip().split()):
-            normalized = word.upper().rstrip(".。")
-            if normalized in valid:
-                return normalized
-        return signal.strip() or None
-
-    return None
+    """Extract normalized decision text from the signal payload.
+    
+    Uses unified normalize_signal to support 5-tier rating:
+    BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL
+    """
+    result = normalize_signal(signal)
+    return result if result != "UNKNOWN" else None
 
 
 def _normalize_confidence(result: Dict[str, Any]) -> Optional[int]:
@@ -305,7 +300,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner = AnalysisRunner(
             symbol=request.symbol,
             date=request.date or datetime.utcnow().strftime("%Y-%m-%d"),
-            analysts=request.analysts or ["market", "news", "social", "fundamentals"],
+            analysts=request.analysts or ["market_index", "market", "news", "social", "fundamentals"],
             llm_model=runner_config["llm_model"],
             llm_provider=runner_config["llm_provider"],
             base_url=runner_config["base_url"],
@@ -318,19 +313,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         result["analysis_type"] = "quick" if request.is_quick else result.get("analysis_type", "full")
 
         if result.get("status") == "error":
-            raise RuntimeError(result.get("error") or "AnalysisRunner returned error status")
+            # Handle structured error dict from AnalysisRunner
+            error_data = result.get("error")
+            if isinstance(error_data, dict):
+                # Structured error with type, message, agent, etc.
+                error_type = error_data.get("type", "unknown")
+                error_msg = error_data.get("message", "Unknown error")
+                raise RuntimeError(f"[{error_type}] {error_msg}")
+            else:
+                # Legacy string error
+                raise RuntimeError(str(error_data) or "AnalysisRunner returned error status")
 
         _update_task_result(task_id, result, AnalysisStatus.COMPLETED.value)
         _update_queue_status(task_id, "COMPLETED")
         return 0
     except Exception as exc:
         error_message = f"{exc}\n{traceback.format_exc()}"
+        
+        # Try to extract structured error info if available
+        structured_error = None
+        if hasattr(exc, '__cause__') and isinstance(exc.__cause__, RuntimeError):
+            cause_str = str(exc.__cause__)
+            if cause_str.startswith('['):
+                # This was our structured error, extract type
+                error_type = cause_str[1:].split(']')[0] if ']' in cause_str else 'unknown'
+                structured_error = {"type": error_type, "full_trace": error_message}
+        
+        # Store structured error as JSON if available, otherwise plain string
+        db_error = json.dumps(structured_error, ensure_ascii=False) if structured_error else error_message
+        
         _update_queue_status(task_id, "FAILED", error=error_message)
         _update_task_status(
             task_id,
             AnalysisStatus.FAILED.value,
             message=f"Analysis failed for {task_id}",
-            error=error_message,
+            error=db_error,
         )
         print(error_message, file=sys.stderr)
         return 1

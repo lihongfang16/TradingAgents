@@ -9,11 +9,12 @@ Storage is backed by PostgreSQL via SQLAlchemy ORM (AnalysisTask model).
 # pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportGeneralTypeIssues=false, reportMissingTypeArgument=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportDeprecated=false, reportUnannotatedClassAttribute=false
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 # Initialize logger early for module-level logging
@@ -42,6 +43,7 @@ from webapi.models.analysis import (
 from webapi.models.database import AnalysisTask, AnalysisBatch
 from webapi.config.database import SessionLocal
 from webapi.services.queue_service import AnalysisQueueService
+from tradingagents.default_config import DEFAULT_CONFIG
 
 
 def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
@@ -115,6 +117,8 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
         elapsed_time=elapsed_seconds,
         remaining_time=remaining_time,
         llm_streams=task.llm_streams,
+        decision=task.decision,
+        confidence=task.confidence,
     )
 
 
@@ -494,8 +498,9 @@ class AnalysisService:
         on_complete: Callable[[str, Dict[str, Any]], None],
     ) -> None:
         """Wait asynchronously for task completion before firing callbacks."""
+        timeout = DEFAULT_CONFIG.get("analysis_timeout_seconds", 900)
         try:
-            await asyncio.to_thread(self._wait_for_task_completion, task_id, 600)
+            await asyncio.to_thread(self._wait_for_task_completion, task_id, timeout)
         except Exception:
             logger.exception("Completion callback wait failed for %s", task_id)
         finally:
@@ -527,7 +532,8 @@ class AnalysisService:
         task_resp = self._prepare_task_for_queue(task_id, request, priority=priority)
 
         if blocking:
-            final_task = await asyncio.to_thread(self._wait_for_task_completion, task_id, 600)
+            timeout = DEFAULT_CONFIG.get("analysis_timeout_seconds", 900)
+            final_task = await asyncio.to_thread(self._wait_for_task_completion, task_id, timeout)
             self._invoke_on_complete(task_id, on_complete)
             return final_task
 
@@ -583,7 +589,7 @@ class AnalysisService:
         runner = AnalysisRunner(
             symbol=request.symbol,
             date=request.date or datetime.utcnow().strftime("%Y-%m-%d"),
-            analysts=request.analysts or ["market", "news", "social", "fundamentals"],
+            analysts=request.analysts or ["market_index", "market", "news", "social", "fundamentals"],
             llm_model=runner_config["llm_model"],
             llm_provider=runner_config["llm_provider"],
             base_url=runner_config["base_url"],
@@ -863,6 +869,125 @@ class AnalysisService:
         )
         self._batch_tasks[batch_id] = batch_response
         return batch_response
+
+    # ------------------------------------------------------------------
+    # Error query methods for debugging and monitoring
+    # ------------------------------------------------------------------
+
+    def get_error_stats(self, days: int = 7) -> Dict[str, int]:
+        """Get error statistics by type for the last N days.
+        
+        Parses the structured error JSON stored in task.error field.
+        
+        Args:
+            days: Number of days to look back (default 7)
+            
+        Returns:
+            Dict mapping error types to counts
+        """
+        from sqlalchemy import text
+        
+        db = SessionLocal()
+        try:
+            # Query error counts by type using PostgreSQL JSON operator
+            # error::jsonb->>'type' extracts the 'type' field from JSON
+            # Use :days * interval '1 day' for proper parameter binding
+            query = text("""
+                SELECT 
+                    COALESCE(error::jsonb->>'type', 'unknown') as error_type,
+                    COUNT(*) as count
+                FROM analysis_tasks
+                WHERE status = 'FAILED'
+                    AND error IS NOT NULL
+                    AND created_at >= NOW() - (:days * INTERVAL '1 day')
+                GROUP BY error::jsonb->>'type'
+                ORDER BY count DESC
+            """)
+            
+            result = db.execute(query, {"days": days})
+            stats: Dict[str, int] = {}
+            for row in result:
+                stats[row.error_type] = row.count
+            return stats
+        except Exception as e:
+            logger.warning(f"Error querying error stats: {e}")
+            return {}
+        finally:
+            db.close()
+
+    def get_llm_timeout_tasks(self, days: int = 7, limit: int = 100) -> List[AnalysisResponse]:
+        """Get tasks that failed due to LLM timeout for retry debugging.
+        
+        Args:
+            days: Number of days to look back (default 7)
+            limit: Maximum number of tasks to return
+            
+        Returns:
+            List of AnalysisResponse for timeout errors
+        """
+        db = SessionLocal()
+        try:
+            # Query for tasks with llm_timeout error type
+            # Use PostgreSQL JSON containment operator @>
+            tasks = db.query(AnalysisTask).filter(
+                AnalysisTask.status == AnalysisStatus.FAILED.value,
+                AnalysisTask.error.isnot(None),
+                AnalysisTask.created_at >= datetime.utcnow() - timedelta(days=days)
+            ).order_by(AnalysisTask.created_at.desc()).limit(limit).all()
+            
+            # Filter for llm_timeout errors by parsing JSON
+            timeout_tasks = []
+            for task in tasks:
+                try:
+                    error_data = json.loads(task.error) if task.error else {}
+                    if error_data.get("type") == "llm_timeout":
+                        timeout_tasks.append(_orm_to_response(task))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                    
+            return timeout_tasks
+        except Exception as e:
+            logger.warning(f"Error querying LLM timeout tasks: {e}")
+            return []
+        finally:
+            db.close()
+
+    def get_tasks_by_error_type(self, error_type: str, days: int = 7, limit: int = 100) -> List[AnalysisResponse]:
+        """Get tasks filtered by specific error type.
+        
+        Args:
+            error_type: Error type to filter by (e.g., 'llm_timeout', 'api_error')
+            days: Number of days to look back (default 7)
+            limit: Maximum number of tasks to return
+            
+        Returns:
+            List of AnalysisResponse matching the error type
+        """
+        db = SessionLocal()
+        try:
+            # Get recent failed tasks and filter by error type
+            tasks = db.query(AnalysisTask).filter(
+                AnalysisTask.status == AnalysisStatus.FAILED.value,
+                AnalysisTask.error.isnot(None),
+                AnalysisTask.created_at >= datetime.utcnow() - timedelta(days=days)
+            ).order_by(AnalysisTask.created_at.desc()).limit(limit).all()
+            
+            # Filter by error type
+            matching_tasks = []
+            for task in tasks:
+                try:
+                    error_data = json.loads(task.error) if task.error else {}
+                    if error_data.get("type") == error_type:
+                        matching_tasks.append(_orm_to_response(task))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                    
+            return matching_tasks
+        except Exception as e:
+            logger.warning(f"Error querying tasks by error type: {e}")
+            return []
+        finally:
+            db.close()
 
     def shutdown(self) -> None:
         """Shutdown cleanup (no-op for queue-based architecture)."""
