@@ -2684,6 +2684,19 @@ def render_watchlist_manager():
         # --- Control buttons ---
         render_control_buttons()
         
+        # --- Detail/settings modals right after list so user sees them ---
+        if st.session_state.get('show_stock_detail'):
+            render_stock_detail_modal()
+        
+        if st.session_state.get('show_stock_settings'):
+            render_stock_settings_modal()
+
+        if st.session_state.get('show_edit_stock'):
+            render_edit_stock_modal()
+        
+        if st.session_state.get('show_diff_modal'):
+            render_diff_modal()
+        
         st.divider()
         
         # --- Real-time monitoring panel ---
@@ -2698,19 +2711,6 @@ def render_watchlist_manager():
         
         # --- Notification settings ---
         render_notification_settings()
-        
-        # --- Modals (rendered last, on top of content) ---
-        if st.session_state.get('show_stock_detail'):
-            render_stock_detail_modal()
-        
-        if st.session_state.get('show_stock_settings'):
-            render_stock_settings_modal()
-
-        if st.session_state.get('show_edit_stock'):
-            render_edit_stock_modal()
-        
-        if st.session_state.get('show_diff_modal'):
-            render_diff_modal()
         
         # --- Auto-refresh logic (non-blocking via st.fragment) ---
         if st.session_state.get('auto_refresh', True):
