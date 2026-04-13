@@ -11,6 +11,22 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_stock_name(symbol: str) -> str:
+    """Fetch stock name for a given symbol, cached for 1 hour."""
+    if not symbol or symbol == "Unknown":
+        return ""
+    try:
+        from tradingagents.dataflows.ashare_provider import AshareProvider
+
+        quote = AshareProvider().get_realtime_quote(symbol)
+        if quote and quote.get("name"):
+            return str(quote["name"])
+    except Exception:
+        pass
+    return ""
+
+
 # History storage path - store in project directory for persistence
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 HISTORY_FILE = os.path.join(HISTORY_DIR, "history.json")
@@ -743,7 +759,14 @@ def render_history_manager() -> Optional[str]:
             status_icon, status_text, status_color = STATUS_CONFIG.get(status, ("⚪", status or "未知", "#9E9E9E"))
 
             with col1:
-                st.markdown(f"### 📊 {symbol}")
+                name = _get_stock_name(symbol)
+                if name:
+                    st.markdown(
+                        f"### 📊 {symbol} <span style='font-size:0.8rem;color:#6B7280;'> {name}</span>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(f"### 📊 {symbol}")
                 st.caption(f"🕐 {date_str}")
                 st.caption(f"{status_icon} {status_text}")
 
