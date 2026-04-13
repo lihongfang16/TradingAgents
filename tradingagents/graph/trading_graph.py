@@ -13,6 +13,12 @@ from langgraph.prebuilt import ToolNode
 from tradingagents.llm_clients import create_llm_client
 
 from tradingagents.agents import *
+
+from tradingagents.dataflows.index_sector_tools import (
+    get_stock_market_and_sector,
+    get_index_kline,
+    get_sector_kline,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.memory import FinancialSituationMemory
 from tradingagents.agents.utils.agent_states import (
@@ -104,12 +110,6 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
-        
-        # Wrap LLMs with timeout protection
-        from ..llm_clients.timeout_wrapper import TimeoutWrapper
-        timeout_seconds = self.config.get("llm_nodata_timeout_seconds", 120)
-        self.deep_thinking_llm = TimeoutWrapper(self.deep_thinking_llm, timeout_seconds)
-        self.quick_thinking_llm = TimeoutWrapper(self.quick_thinking_llm, timeout_seconds)
         
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
@@ -213,6 +213,14 @@ class TradingAgentsGraph:
                     get_balance_sheet,
                     get_cashflow,
                     get_income_statement,
+                ]
+            ),
+            "market_index": ToolNode(
+                [
+                    # Market index and sector analysis tools
+                    get_stock_market_and_sector,
+                    get_index_kline,
+                    get_sector_kline,
                 ]
             ),
         }

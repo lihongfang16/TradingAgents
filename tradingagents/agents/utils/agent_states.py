@@ -61,6 +61,9 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
+    # market index analysis step
+    market_index_report: Annotated[str, "Report from the Market Index Analyst"]
+
     # researcher team discussion step
     investment_debate_state: Annotated[
         InvestDebateState, "Current state of the debate on if to invest or not"

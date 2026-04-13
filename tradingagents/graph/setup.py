@@ -61,6 +61,15 @@ class GraphSetup:
         delete_nodes = {}
         tool_nodes = {}
 
+        # Market Index Analyst — registered with explicit names (not via dynamic loop
+        # because "market_index".capitalize() would produce "Market_index" not "Market Index")
+        if "market_index" in selected_analysts:
+            analyst_nodes["market_index"] = create_market_index_analyst(
+                self.quick_thinking_llm
+            )
+            delete_nodes["market_index"] = create_msg_delete()
+            tool_nodes["market_index"] = self.tool_nodes["market_index"]
+
         if "market" in selected_analysts:
             analyst_nodes["market"] = create_market_analyst(
                 self.quick_thinking_llm
@@ -115,11 +124,20 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for analyst_type, node in analyst_nodes.items():
+            # market_index uses explicit node names "Market Index Analyst" etc., skip here
+            if analyst_type == "market_index":
+                continue
             workflow.add_node(f"{analyst_type.capitalize()} Analyst", node)
             workflow.add_node(
                 f"Msg Clear {analyst_type.capitalize()}", delete_nodes[analyst_type]
             )
             workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
+
+        # Register Market Index Analyst with explicit names
+        if "market_index" in selected_analysts:
+            workflow.add_node("Market Index Analyst", analyst_nodes["market_index"])
+            workflow.add_node("Msg Clear Market Index", delete_nodes["market_index"])
+            workflow.add_node("tools_market_index", tool_nodes["market_index"])
 
         # Add other nodes
         workflow.add_node("Trader", trader_node)
@@ -138,25 +156,37 @@ class GraphSetup:
         # Define edges
         # Start with the first analyst
         first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
+        if first_analyst == "market_index":
+            workflow.add_edge(START, "Market Index Analyst")
+        else:
+            workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
 
         # Connect analysts in sequence
         for i, analyst_type in enumerate(selected_analysts):
-            current_analyst = f"{analyst_type.capitalize()} Analyst"
-            current_tools = f"tools_{analyst_type}"
-            current_clear = f"Msg Clear {analyst_type.capitalize()}"
+            # market_index uses explicit node names
+            if analyst_type == "market_index":
+                current_analyst = "Market Index Analyst"
+                current_tools = "tools_market_index"
+                current_clear = "Msg Clear Market Index"
+                should_continue = "should_continue_market_index"
+            else:
+                current_analyst = f"{analyst_type.capitalize()} Analyst"
+                current_tools = f"tools_{analyst_type}"
+                current_clear = f"Msg Clear {analyst_type.capitalize()}"
+                should_continue = f"should_continue_{analyst_type}"
 
             # Add conditional edges for current analyst
             workflow.add_conditional_edges(
                 current_analyst,
-                getattr(self.conditional_logic, f"should_continue_{analyst_type}"),
+                getattr(self.conditional_logic, should_continue),
                 [current_tools, current_clear],
             )
             workflow.add_edge(current_tools, current_analyst)
 
             # Connect to next analyst or to Bull Researcher if this is the last analyst
             if i < len(selected_analysts) - 1:
-                next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
+                next_type = selected_analysts[i + 1]
+                next_analyst = "Market Index Analyst" if next_type == "market_index" else f"{next_type.capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
                 workflow.add_edge(current_clear, "Quick Risk Check" if fast_mode else "Bull Researcher")
