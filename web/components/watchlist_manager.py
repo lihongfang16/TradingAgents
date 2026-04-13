@@ -1707,45 +1707,30 @@ def render_watchlist_table():
         status_batch = fetch_watchlist_status_batch(all_symbols)
     
     # (Legacy table header removed — rows are now vertical cards with hover-reveal buttons)
-    st.caption("💡 鼠标悬停在股票行上可高亮操作按钮")
+    st.caption("💡 点击 👁️ 查看详情，按钮帮助信息悬停可见")
     
-    # CSS for compact vertical rows with hover-reveal buttons
+    # Global CSS for compact muted buttons (no hover wrap possible in this Streamlit version)
     st.markdown("""
     <style>
-    .watchlist-row {
-        transition: background-color 0.2s ease;
-    }
-    .watchlist-row:hover {
-        background-color: rgba(0,0,0,0.04);
-    }
-    .watchlist-row .stButton > button {
-        opacity: 0.35 !important;
-        transition: opacity 0.2s ease !important;
-    }
-    .watchlist-row:hover .stButton > button {
-        opacity: 1 !important;
-    }
-    .watchlist-row .stButton > button:disabled {
-        opacity: 0.25 !important;
+    div[data-testid="stHorizontalBlock"] .stButton > button {
+        padding: 0.15rem 0.35rem !important;
+        min-height: 24px !important;
+        font-size: 0.75rem !important;
+        line-height: 1 !important;
     }
     </style>
     """, unsafe_allow_html=True)
     
-    # Table rows
     for item in watchlist:
         stock_id = item.get('id', 0)
         symbol = item.get('symbol', 'Unknown')
         name = item.get('name', symbol)
         
-        # Price data
         last_price = item.get('last_price', 0)
         last_change_pct = item.get('last_change_pct', 0)
-        
-        # AI signal data
         last_signal = item.get('last_signal', 'UNKNOWN')
         last_confidence = item.get('last_confidence', 0)
         
-        # High frequency status
         is_high_freq = item.get('is_high_frequency', False)
         high_freq_until_str = item.get('high_freq_until')
         high_freq_until = None
@@ -1755,136 +1740,100 @@ def render_watchlist_table():
             except:
                 pass
         
-        # Determine row highlighting
         is_turning = is_high_freq and high_freq_until and high_freq_until > datetime.utcnow()
         importance_high = last_confidence is not None and last_confidence > 0.9 and last_signal in ['BUY', 'SELL']
         
-        # Row container with optional highlighting
-        if is_turning or importance_high:
-            st.markdown(
-                """
-                <div style="background-color: rgba(255, 193, 7, 0.1); 
-                            border-left: 3px solid #FFC107; 
-                            padding: 8px; 
-                            margin: 4px 0;
-                            border-radius: 4px;">
-                """,
-                unsafe_allow_html=True
-            )
-        
-        # Vertical 3-line row with hover-reveal buttons
-        row_bg = "rgba(255, 193, 7, 0.08)" if (is_turning or importance_high) else "transparent"
-        border_left = "3px solid #FFC107" if (is_turning or importance_high) else "2px solid transparent"
-        st.markdown(
-            f'<div class="watchlist-row" style="background-color: {row_bg}; border-left: {border_left}; border-radius: 6px; padding: 8px 10px; margin: 4px 0;">',
-            unsafe_allow_html=True
-        )
-        
-        # Line 1: Basic info (code | name | price | change)
-        info_parts = [f"**{symbol}**"]
-        if name:
-            info_parts.append(name[:10])
-        if last_price:
-            color = "#4CAF50" if last_change_pct and last_change_pct > 0 else "#F44336"
-            sign = "+" if last_change_pct and last_change_pct > 0 else ""
-            info_parts.append(f"¥{last_price:.2f}")
-            if last_change_pct:
-                info_parts.append(f"<span style='color:{color};font-size:0.85em'>{sign}{last_change_pct:.1f}%</span>")
-        st.markdown(" | ".join(info_parts), unsafe_allow_html=True)
-        
-        # Line 2: Signal + next analysis
-        signal_text = format_signal(last_signal, last_confidence)
-        next_text = get_next_analysis_text(is_high_freq, high_freq_until, item.get('last_analysis_at'))
-        st.markdown(f"<small>{signal_text} | {next_text} {'🔥' if is_turning else ''}</small>", unsafe_allow_html=True)
-        
-        # Line 3: Action buttons
-        _sym_status = status_batch.get(symbol, {})
-        is_analyzing = _sym_status.get("is_analyzing", False)
-        has_full_today = _sym_status.get("has_full_analysis_today", False)
-        has_multiple = _sym_status.get("has_multiple_analyses", False)
-        if st.session_state.get("optimistic_analysis_state", {}).get(symbol) == "running":
-            is_analyzing = True
-        if not is_analyzing and st.session_state.get("optimistic_analysis_state", {}).get(symbol):
-            st.session_state.get("optimistic_analysis_state").pop(symbol, None)
-        
-        btn_cols = st.columns([0.8, 1, 1, 1, 1, 0.8, 0.8, 0.8])
-        
-        with btn_cols[0]:  # View
-            if st.button("👁️", key=f"view_{stock_id}", help="查看"):
-                st.session_state.selected_stock = item
-                st.session_state.show_stock_detail = True
-        
-        with btn_cols[1]:  # Force refresh checkbox (compact)
-            st.checkbox("☐", key=f"fr_{stock_id}", help="强刷", label_visibility="collapsed")
-        
-        with btn_cols[2]:  # Full analysis
-            if is_analyzing:
-                st.button("📊", key=f"full_{stock_id}", disabled=True, help="⏳ 分析中，请等待完成")
-            else:
-                if st.button("📊", key=f"full_{stock_id}", help="全量分析"):
-                    st.session_state.setdefault("optimistic_analysis_state", {})[symbol] = "running"
-                    result = trigger_full_analysis(symbol, st.session_state.get(f"fr_{stock_id}", False))
-                    if result:
-                        invalidate_batch_status_cache([symbol])
-                        st.toast(f"🚀 {symbol} 全量分析已启动", icon="✅")
-                    else:
-                        st.session_state.get("optimistic_analysis_state").pop(symbol, None)
-                    st.rerun()
-        
-        with btn_cols[3]:  # Incremental
-            incr_disabled = not has_full_today or is_analyzing
-            if incr_disabled:
-                incr_reason = "⏳ 分析中" if is_analyzing else "❗ 请先完成全量分析"
-            else:
-                incr_reason = "增量分析"
-            if st.button("🔄", key=f"incr_{stock_id}", disabled=incr_disabled, help=incr_reason):
-                st.session_state['incr_panel_stock_id'] = stock_id
-                st.rerun()
-        
-        with btn_cols[4]:  # Diff
-            diff_disabled = not has_multiple or is_analyzing
-            if diff_disabled:
-                diff_reason = "⏳ 分析中" if is_analyzing else "❗ 需要至少2次分析"
-            else:
-                diff_reason = "差异对比"
-            if st.button("📋", key=f"diff_{stock_id}", disabled=diff_disabled, help=diff_reason):
-                st.session_state.diff_report_data = fetch_diff_report(symbol)
-                st.session_state.diff_symbol = symbol
-                st.session_state.show_diff_modal = True
-                st.rerun()
-        
-        with btn_cols[5]:  # Edit
-            if st.button("✏️", key=f"edit_{stock_id}", help="编辑"):
-                st.session_state.selected_stock = item
-                st.session_state.show_edit_stock = True
-                st.rerun()
-        
-        with btn_cols[6]:  # Settings
-            if st.button("⚙️", key=f"set_{stock_id}", help="设置"):
-                st.session_state.selected_stock = item
-                st.session_state.show_stock_settings = True
-        
-        with btn_cols[7]:  # Delete
-            confirm_key = f"confirm_del_{stock_id}"
-            if st.session_state.get(confirm_key):
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✅", key=f"y_{stock_id}"):
-                        if delete_watchlist_stock(stock_id):
-                            st.session_state[confirm_key] = False
-                            load_watchlist.clear()
-                            st.rerun()
-                with c2:
-                    if st.button("❌", key=f"n_{stock_id}"):
-                        st.session_state[confirm_key] = False
+        with st.container():
+            alert_emoji = "🔥 " if (is_turning or importance_high) else ""
+            # Line 1: basic info
+            info_parts = [f"{alert_emoji}**{symbol}**"]
+            if name:
+                info_parts.append(name[:8])
+            if last_price:
+                color = "#4CAF50" if last_change_pct and last_change_pct > 0 else "#F44336"
+                sign = "+" if last_change_pct and last_change_pct > 0 else ""
+                info_parts.append(f"¥{last_price:.2f}")
+                if last_change_pct:
+                    info_parts.append(f"<span style='color:{color};font-size:0.85em'>{sign}{last_change_pct:.1f}%</span>")
+            st.markdown(" | ".join(info_parts), unsafe_allow_html=True)
+            
+            # Line 2: signal
+            signal_text = format_signal(last_signal, last_confidence)
+            next_text = get_next_analysis_text(is_high_freq, high_freq_until, item.get('last_analysis_at'))
+            st.markdown(f"<small>{signal_text} | {next_text}</small>", unsafe_allow_html=True)
+            
+            # Line 3: buttons
+            _sym_status = status_batch.get(symbol, {})
+            is_analyzing = _sym_status.get("is_analyzing", False)
+            has_full_today = _sym_status.get("has_full_analysis_today", False)
+            has_multiple = _sym_status.get("has_multiple_analyses", False)
+            if st.session_state.get("optimistic_analysis_state", {}).get(symbol) == "running":
+                is_analyzing = True
+            if not is_analyzing and st.session_state.get("optimistic_analysis_state", {}).get(symbol):
+                st.session_state.get("optimistic_analysis_state").pop(symbol, None)
+            
+            btn_cols = st.columns([0.7, 0.7, 0.8, 0.8, 0.8, 0.7, 0.7, 0.7])
+            
+            with btn_cols[0]:
+                if st.button("👁️", key=f"view_{stock_id}", help="查看"):
+                    st.session_state.selected_stock = item
+                    st.session_state.show_stock_detail = True
+            with btn_cols[1]:
+                st.checkbox("☐", key=f"fr_{stock_id}", help="强刷", label_visibility="collapsed")
+            with btn_cols[2]:
+                if is_analyzing:
+                    st.button("📊", key=f"full_{stock_id}", disabled=True, help="⏳ 分析中")
+                else:
+                    if st.button("📊", key=f"full_{stock_id}", help="全量"):
+                        st.session_state.setdefault("optimistic_analysis_state", {})[symbol] = "running"
+                        result = trigger_full_analysis(symbol, st.session_state.get(f"fr_{stock_id}", False))
+                        if result:
+                            invalidate_batch_status_cache([symbol])
+                            st.toast(f"🚀 {symbol} 全量分析已启动", icon="✅")
+                        else:
+                            st.session_state.get("optimistic_analysis_state").pop(symbol, None)
                         st.rerun()
-            else:
-                if st.button("🗑️", key=f"del_{stock_id}", help="删除"):
-                    st.session_state[confirm_key] = True
+            with btn_cols[3]:
+                incr_disabled = not has_full_today or is_analyzing
+                incr_reason = "⏳ 分析中" if is_analyzing else "❗ 先全量" if incr_disabled else "增量"
+                if st.button("🔄", key=f"incr_{stock_id}", disabled=incr_disabled, help=incr_reason):
+                    st.session_state['incr_panel_stock_id'] = stock_id
                     st.rerun()
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.divider()
+            with btn_cols[4]:
+                diff_disabled = not has_multiple or is_analyzing
+                diff_reason = "⏳ 分析中" if is_analyzing else "❗ ≥2次" if diff_disabled else "差异"
+                if st.button("📋", key=f"diff_{stock_id}", disabled=diff_disabled, help=diff_reason):
+                    st.session_state.diff_report_data = fetch_diff_report(symbol)
+                    st.session_state.diff_symbol = symbol
+                    st.session_state.show_diff_modal = True
+                    st.rerun()
+            with btn_cols[5]:
+                if st.button("✏️", key=f"edit_{stock_id}", help="编辑"):
+                    st.session_state.selected_stock = item
+                    st.session_state.show_edit_stock = True
+                    st.rerun()
+            with btn_cols[6]:
+                if st.button("⚙️", key=f"set_{stock_id}", help="设置"):
+                    st.session_state.selected_stock = item
+                    st.session_state.show_stock_settings = True
+            with btn_cols[7]:
+                confirm_key = f"confirm_del_{stock_id}"
+                if st.session_state.get(confirm_key):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✅", key=f"y_{stock_id}"):
+                            if delete_watchlist_stock(stock_id):
+                                st.session_state[confirm_key] = False
+                                load_watchlist.clear()
+                                st.rerun()
+                    with c2:
+                        if st.button("❌", key=f"n_{stock_id}"):
+                            st.session_state[confirm_key] = False
+                            st.rerun()
+                else:
+                    if st.button("🗑️", key=f"del_{stock_id}", help="删除"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
 
 
 def render_control_buttons():
@@ -2670,7 +2619,7 @@ def render_watchlist_manager():
         # -----------------------------------------------------------------------
         # Two-column layout: list on left, detail modals on right.
         # -----------------------------------------------------------------------
-        left_col, right_col = st.columns([0.8, 1.4])
+        left_col, right_col = st.columns([0.55, 1.45])
         
         with left_col:
             # --- Watchlist table ---
