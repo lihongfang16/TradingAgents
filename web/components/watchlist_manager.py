@@ -41,11 +41,14 @@ def _render_auto_refresh_fragment():
         st.session_state.watchlist_data = watchlist_data
 
 
-def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
-    """Get intraday price data for a stock.
+def get_stock_intraday_data(symbol: str, lookback_days: int = 2) -> Optional[pd.DataFrame]:
+    """Get price data for a stock with adaptive period based on lookback.
 
     Args:
         symbol: 6-digit stock code (e.g. '000001')
+        lookback_days: How many days of history to fetch. Determines the
+            kline period automatically (5m for <=2 days, 60m for <=30 days,
+            daily for longer).
 
     Returns:
         DataFrame with DatetimeIndex and OHLCV columns
@@ -56,9 +59,16 @@ def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
         from tradingagents.dataflows.ashare_provider import AshareProvider
         provider = AshareProvider()
 
-        # Try to get intraday kline data first - fetch more data to cover
-        # the analysis history window (5 days of 5m data = ~240 bars per day)
-        df = provider.get_kline(symbol, period="5m", limit=480)
+        # Adaptive period based on lookback_days
+        if lookback_days <= 2:
+            period, limit = "5m", 480
+        elif lookback_days <= 30:
+            # ~8 bars per day for 60m data
+            period, limit = "60m", max(lookback_days * 8, 120)
+        else:
+            period, limit = "day", lookback_days + 10
+
+        df = provider.get_kline(symbol, period=period, limit=limit)
 
         if df is not None and not df.empty:
             # Filter out non-trading periods (volume=0) to remove weekends/holidays
@@ -259,17 +269,25 @@ def render_candlestick_chart(
             try:
                 # Parse timestamp and find matching index in df
                 item_ts = pd.to_datetime(timestamp)
+                item_date = item_ts.date()
 
-                # Find closest index in df
-                closest_idx = None
-                min_diff = float('inf')
-                for i, idx in enumerate(df.index):
-                    diff = abs((idx - item_ts).total_seconds())
-                    if diff < min_diff:
-                        min_diff = diff
-                        closest_idx = i
+                # Match signals to bars on the same trading day.
+                # This avoids the overnight-gap issue where analysis runs
+                # outside market hours (e.g. 02:44) but K-line bars only
+                # exist during trading hours (e.g. 10:30, 15:00).
+                same_day_indices = [
+                    (i, idx) for i, idx in enumerate(df.index)
+                    if idx.date() == item_date
+                ]
 
-                if closest_idx is None or min_diff > 300:  # Skip if more than 5 minutes off
+                if same_day_indices:
+                    # Pick the closest bar on the same day
+                    closest_idx = min(
+                        same_day_indices,
+                        key=lambda pair: abs((pair[1] - item_ts).total_seconds()),
+                    )[0]
+                else:
+                    # Fallback: no bar on that day (holiday/weekend) – skip
                     continue
 
                 # Determine y position based on signal type
@@ -2260,7 +2278,21 @@ def render_stock_detail_modal():
                     # Show K-line chart with signals and trajectory
                     symbol = item.get('symbol', 'Unknown')
                     name = item.get('name', symbol)
-                    detail_df = get_stock_intraday_data(symbol)
+
+                    # Determine lookback based on analysis history so signals align
+                    if analysis_data:
+                        oldest_ts = min(
+                            (pd.to_datetime(rec.get('timestamp')) for rec in analysis_data if rec.get('timestamp')),
+                            default=None,
+                        )
+                        if oldest_ts is not None:
+                            lookback_days = max(2, (datetime.now() - oldest_ts).days + 2)
+                        else:
+                            lookback_days = 2
+                    else:
+                        lookback_days = 2
+
+                    detail_df = get_stock_intraday_data(symbol, lookback_days=lookback_days)
                     if detail_df is not None and not detail_df.empty:
                         render_candlestick_chart(
                             detail_df,
