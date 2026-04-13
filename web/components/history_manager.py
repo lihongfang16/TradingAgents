@@ -10,6 +10,44 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+# Import unified signal extractor
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from webapi.utils.signal_extractor import extract_decision_with_fallback
+
+
+def _extract_from_api_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a history record from an API task response.
+
+    Priority:
+    1. Use DB fields ``decision`` / ``confidence`` if present.
+    2. Fallback to ``extract_decision_with_fallback`` on the raw result.
+    """
+    result_data = task.get("result", {}) or {}
+
+    db_decision = task.get("decision")
+    db_confidence = task.get("confidence")
+
+    if db_decision and db_decision != "UNKNOWN":
+        decision = db_decision
+        confidence = (db_confidence / 100.0) if isinstance(db_confidence, (int, float)) else 0.0
+    else:
+        decision, confidence = extract_decision_with_fallback(result_data)
+
+    return {
+        "task_id": task.get("task_id"),
+        "symbol": task.get("symbol", ""),
+        "exchange": task.get("exchange", "CN"),
+        "created_at": task.get("created_at", ""),
+        "updated_at": task.get("updated_at", ""),
+        "status": task.get("status", "PENDING"),
+        "decision": decision,
+        "confidence": confidence,
+        "reasoning": "",
+        "risk_level": "",
+        "indicators": {},
+        "raw_result": result_data,
+    }
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _get_stock_name(symbol: str) -> str:
@@ -113,71 +151,17 @@ def save_deleted_ids(deleted_ids: set[str]):
 def load_history_fast() -> List[Dict[str, Any]]:
     """Fast loading with short timeout to avoid UI blocking."""
     ensure_history_dir()
-    
-    # Helper to extract decision from final_state messages
-    def extract_decision_from_result(result_data):
-        """Extract decision, confidence from result.final_state.messages if available."""
-        decision = ""
-        confidence = 0
-        
-        final_state = result_data.get("final_state", {}) if isinstance(result_data, dict) else {}
-        if not final_state:
-            return decision, confidence
-        
-        messages = final_state.get("messages", [])
-        if messages:
-            # Get last message content
-            last_msg = messages[-1]
-            if isinstance(last_msg, dict):
-                content = last_msg.get("content", "")
-            elif hasattr(last_msg, 'content'):
-                content = last_msg.content
-            else:
-                content = str(last_msg) if last_msg else ""
-            
-            # Extract decision from "FINAL TRANSACTION PROPOSAL: **BUY/SELL/HOLD**"
-            if "FINAL TRANSACTION PROPOSAL:" in content:
-                proposal_section = content.split("FINAL TRANSACTION PROPOSAL:")[-1].split("---")[0].strip()
-                if "**买入**" in proposal_section or "BUY" in proposal_section.upper():
-                    decision = "BUY"
-                elif "**卖出**" in proposal_section or "SELL" in proposal_section.upper():
-                    decision = "SELL"
-                elif "**持有**" in proposal_section or "HOLD" in proposal_section.upper():
-                    decision = "HOLD"
-        
-        return decision, confidence
-    
+
     # Try API with short timeout (1.5s to avoid UI blocking)
     try:
         resp = requests.get(f"{API_URL}/api/v1/analysis/", params={"limit": 50}, timeout=1.5)
         if resp.status_code == 200:
             api_tasks = resp.json()
-            records = []
-            for task in api_tasks:
-                result_data = task.get("result", {}) or {}
-                decision, confidence = extract_decision_from_result(result_data)
-                
-                # Convert API task to history record format
-                record = {
-                    "task_id": task.get("task_id"),
-                    "symbol": task.get("symbol", ""),
-                    "exchange": task.get("exchange", "CN"),
-                    "created_at": task.get("created_at", ""),
-                    "updated_at": task.get("updated_at", ""),
-                    "status": task.get("status", "PENDING"),
-                    "decision": decision,
-                    "confidence": confidence,
-                    "reasoning": "",
-                    "risk_level": "",
-                    "indicators": {},
-                    "raw_result": result_data
-                }
-                records.append(record)
-            return records
+            return [_extract_from_api_task(task) for task in api_tasks]
     except Exception:
         # API unavailable or slow - fall through to local cache
         pass
-    
+
     # FALLBACK: Use local cache only
     local_records = []
     if os.path.exists(HISTORY_FILE):
@@ -190,7 +174,7 @@ def load_history_fast() -> List[Dict[str, Any]]:
                     local_records = data
         except Exception:
             traceback.print_exc(file=sys.stderr)
-    
+
     return local_records
 
 
@@ -205,42 +189,9 @@ def load_history() -> List[Dict[str, Any]]:
         List of history records from API (or local cache if API down)
     """
     ensure_history_dir()
-    
-    # Helper to extract decision from final_state messages
-    def extract_decision_from_result(result_data):
-        """Extract decision, confidence from result.final_state.messages if available."""
-        decision = ""
-        confidence = 0
-        
-        final_state = result_data.get("final_state", {}) if isinstance(result_data, dict) else {}
-        if not final_state:
-            return decision, confidence
-        
-        messages = final_state.get("messages", [])
-        if messages:
-            # Get last message content
-            last_msg = messages[-1]
-            if isinstance(last_msg, dict):
-                content = last_msg.get("content", "")
-            elif hasattr(last_msg, 'content'):
-                content = last_msg.content
-            else:
-                content = str(last_msg) if last_msg else ""
-            
-            # Extract decision from "FINAL TRANSACTION PROPOSAL: **BUY/SELL/HOLD**"
-            if "FINAL TRANSACTION PROPOSAL:" in content:
-                proposal_section = content.split("FINAL TRANSACTION PROPOSAL:")[-1].split("---")[0].strip()
-                if "**买入**" in proposal_section or "BUY" in proposal_section.upper():
-                    decision = "BUY"
-                elif "**卖出**" in proposal_section or "SELL" in proposal_section.upper():
-                    decision = "SELL"
-                elif "**持有**" in proposal_section or "HOLD" in proposal_section.upper():
-                    decision = "HOLD"
-        
-        return decision, confidence
-    
+
     # PRIMARY: Try to fetch from API (PostgreSQL is source of truth)
-    api_records = []
+    api_records: List[Dict[str, Any]] = []
     api_available = False
     try:
         resp = requests.get(f"{API_URL}/api/v1/analysis/", params={"limit": 50}, timeout=5)
@@ -248,33 +199,15 @@ def load_history() -> List[Dict[str, Any]]:
             api_available = True
             api_tasks = resp.json()
             for task in api_tasks:
-                result_data = task.get("result", {}) or {}
-                decision, confidence = extract_decision_from_result(result_data)
-                
-                # Convert API task to history record format
-                record = {
-                    "task_id": task.get("task_id"),
-                    "symbol": task.get("symbol", ""),
-                    "exchange": task.get("exchange", "CN"),
-                    "created_at": task.get("created_at", ""),
-                    "updated_at": task.get("updated_at", ""),
-                    "status": task.get("status", "PENDING"),
-                    "decision": decision,
-                    "confidence": confidence,
-                    "reasoning": "",
-                    "risk_level": "",
-                    "indicators": {},
-                    "raw_result": result_data
-                }
-                api_records.append(record)
+                api_records.append(_extract_from_api_task(task))
     except Exception:
         # API unavailable, will fall back to local cache
         pass
-    
+
     # If API is available, use it as source of truth (ignore local merge)
     if api_available:
         return api_records
-    
+
     # FALLBACK: API unavailable, use local cache only
     local_records = []
     if os.path.exists(HISTORY_FILE):
@@ -287,7 +220,7 @@ def load_history() -> List[Dict[str, Any]]:
                     local_records = data
         except Exception:
             traceback.print_exc(file=sys.stderr)
-    
+
     return local_records
 
 
