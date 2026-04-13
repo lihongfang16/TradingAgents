@@ -76,6 +76,23 @@ def main():
         layout="wide"
     )
     
+    # 全局 CSS
+    st.markdown("""
+        <style>
+        /* 按钮不换行 */
+        .stButton button {
+            white-space: nowrap !important;
+        }
+        /* 禁用按钮 - 增强视觉区分 */
+        .stButton button:disabled,
+        .stButton button[disabled] {
+            opacity: 0.4 !important;
+            cursor: not-allowed !important;
+            filter: grayscale(80%) !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
     # 渲染侧边栏配置
     llm_config = render_sidebar()
     

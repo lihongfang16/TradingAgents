@@ -902,7 +902,7 @@ class SchedulerService:
             name="Watchlist Reconciliation (Every 5 min)",
             replace_existing=True,
             max_instances=1,
-            misfire_grace_time=timedelta(minutes=1),
+            misfire_grace_time=60,  # seconds, APScheduler requires int or None
         )
 
     def stop(self, persist: bool = True) -> None:

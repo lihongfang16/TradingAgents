@@ -14,6 +14,9 @@ from socket import timeout as SocketTimeout
 
 import streamlit as st
 
+# Import incremental analysis panel renderer
+from .watchlist_manager_incremental import render_incremental_analysis_section
+
 
 # API URL - use same default as app.py
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:8002")
@@ -671,134 +674,22 @@ def trigger_quick_analysis(stock_id: int) -> Optional[Dict]:
     try:
         resp = requests.post(
             f"{API_URL}/api/v1/watchlist/{stock_id}/quick-analyze",
-            timeout=5
+            timeout=15
         )
         if resp.status_code == 202 or resp.status_code == 200:
             # Mark pending so auto-refresh can detect completion
             mark_analysis_pending(stock_id)
             return resp.json()
         else:
-            st.error(f"分析触发失败: HTTP {resp.status_code}")
+            st.session_state.setdefault("_analysis_errors", {})[str(stock_id)] = (
+                f"分析触发失败: HTTP {resp.status_code}"
+            )
     except Exception as e:
-        st.error(f"分析触发失败: {str(e)}")
+        st.session_state.setdefault("_analysis_errors", {})[str(stock_id)] = (
+            f"分析触发失败: {str(e)}"
+        )
         traceback.print_exc(file=sys.stderr)
     return None
-
-
-def trigger_incremental_analysis(stock_id: int, symbol: str) -> None:
-    """Trigger incremental analysis with manual analyst selection.
-
-    Flow:
-    1. Call precheck to detect data changes
-    2. Show results in an expander with manual override
-    3. Execute incremental analysis for selected analysts
-
-    Args:
-        stock_id: Watchlist item ID.
-        symbol: Stock symbol (for display).
-    """
-    # Step 1: Precheck
-    with st.spinner("检测数据变化..."):
-        try:
-            resp = requests.post(
-                f"{API_URL}/api/v1/watchlist/{stock_id}/incremental-analyze/precheck",
-                timeout=10,
-            )
-            precheck = resp.json()
-        except requests.exceptions.Timeout:
-            st.error("预检超时，请检查API服务状态")
-            return
-        except Exception as e:
-            st.error(f"预检失败: {str(e)}")
-            traceback.print_exc(file=sys.stderr)
-            return
-
-    if "error" in precheck:
-        st.error(precheck["error"])
-        return
-
-    needs_refresh = precheck.get("needs_refresh", [])
-    cached = precheck.get("cached", [])
-    all_cached = precheck.get("all_cached", False)
-
-    # Display label for the analyst types
-    analyst_labels = {
-        "market": "📈 市场分析",
-        "news": "📰 新闻分析",
-        "sentiment": "💭 情绪分析",
-        "fundamentals": "📊 基本面分析",
-    }
-
-    # Step 2: Show results + manual selection
-    with st.expander("🔍 检测结果", expanded=True):
-        # Needs refresh
-        if needs_refresh:
-            refresh_display = [analyst_labels.get(a, a) for a in needs_refresh]
-            st.markdown(f"**需要刷新**: {', '.join(refresh_display)}")
-        else:
-            st.markdown("**需要刷新**: 无")
-
-        # Cached
-        if cached:
-            cached_display = [analyst_labels.get(a, a) for a in cached]
-            st.markdown(f"**缓存有效**: {', '.join(cached_display)}")
-        else:
-            st.markdown("**缓存有效**: 无")
-
-        if all_cached:
-            st.info("所有分析师数据均无变化，无需刷新。")
-
-        # Manual override: multiselect with labeled analyst types
-        all_analysts = needs_refresh + cached
-        default_selected = list(needs_refresh)
-
-        # Use raw analyst keys internally, display labels to user
-        options_map = {analyst_labels.get(a, a): a for a in all_analysts}
-        selected_labels = st.multiselect(
-            "选择要强制刷新的分析师 (可选覆盖)",
-            options=list(options_map.keys()),
-            default=[analyst_labels.get(a, a) for a in default_selected],
-            key=f"incr_select_{stock_id}",
-        )
-
-        # Map back to internal keys
-        selected_analysts = [options_map[label] for label in selected_labels]
-
-        # Execute button
-        btn_disabled = len(selected_analysts) == 0
-        if st.button(
-            "🚀 开始增量分析",
-            key=f"incr_exec_{stock_id}",
-            disabled=btn_disabled,
-            type="primary",
-        ):
-            if not selected_analysts:
-                st.error("请至少选择一个分析师")
-                return
-
-            # Step 3: Call actual incremental endpoint (sync, may take 1-3 min)
-            with st.spinner("执行增量分析，请稍候 (通常需要1-3分钟)..."):
-                try:
-                    resp = requests.post(
-                        f"{API_URL}/api/v1/watchlist/{stock_id}/incremental-analyze",
-                        json={"force_refresh_analysts": selected_analysts},
-                        timeout=None,  # CRITICAL: no timeout for sync endpoint
-                    )
-                    result = resp.json()
-                except Exception as e:
-                    st.error(f"增量分析失败: {str(e)}")
-                    traceback.print_exc(file=sys.stderr)
-                    return
-
-            if resp.status_code == 200:
-                refreshed = result.get("refresh_analysts", selected_analysts)
-                refreshed_display = [analyst_labels.get(a, a) for a in refreshed]
-                st.success(f"✅ 增量分析完成！刷新了: {', '.join(refreshed_display)}")
-                st.session_state.watchlist_data = load_watchlist()
-                st.rerun()
-            else:
-                error_msg = result.get("error", result.get("detail", "未知错误"))
-                st.error(f"分析失败: {error_msg}")
 
 
 def fetch_diff_report(symbol: str) -> Optional[Dict[str, Any]]:
@@ -1357,7 +1248,10 @@ def start_monitoring() -> bool:
         if resp.status_code == 200:
             return True
         else:
-            error_detail = resp.json().get('detail', f'HTTP {resp.status_code}')
+            try:
+                error_detail = resp.json().get('detail', f'HTTP {resp.status_code}')
+            except Exception:
+                error_detail = resp.text or f'HTTP {resp.status_code}'
             st.error(f"启动监控失败: {error_detail}")
             return False
     except Exception as e:
@@ -1379,7 +1273,10 @@ def stop_monitoring() -> bool:
         if resp.status_code == 200:
             return True
         else:
-            error_detail = resp.json().get('detail', f'HTTP {resp.status_code}')
+            try:
+                error_detail = resp.json().get('detail', f'HTTP {resp.status_code}')
+            except Exception:
+                error_detail = resp.text or f'HTTP {resp.status_code}'
             st.error(f"停止监控失败: {error_detail}")
             return False
     except Exception as e:
@@ -1587,14 +1484,18 @@ def trigger_full_analysis(symbol: str, force_refresh: bool = False) -> Optional[
         resp = requests.post(
             f"{API_URL}/api/v1/watchlist/analyze",
             params={"symbol": symbol, "force_refresh": force_refresh},
-            timeout=5,
+            timeout=15,
         )
         if resp.status_code in (200, 202):
             return resp.json()
         else:
-            st.error(f"全量分析触发失败: HTTP {resp.status_code}")
+            st.session_state.setdefault("_analysis_errors", {})[symbol] = (
+                f"全量分析触发失败: HTTP {resp.status_code}"
+            )
     except Exception as e:
-        st.error(f"全量分析触发失败: {str(e)}")
+        st.session_state.setdefault("_analysis_errors", {})[symbol] = (
+            f"全量分析触发失败: {str(e)}"
+        )
         traceback.print_exc(file=sys.stderr)
     return None
 
@@ -1850,153 +1751,122 @@ def render_watchlist_table():
                 unsafe_allow_html=True
             )
         
-        row_cols = st.columns([1.2, 1.5, 1, 1, 2, 1.5, 1, 1, 1.2])
+        # FINAL FIX: Single row with all buttons horizontal
+        # [Stock Info 50%] [All Actions 50%]
+        main_cols = st.columns([5, 5])
         
-        with row_cols[0]:
-            st.write(f"**{symbol}**")
-        
-        with row_cols[1]:
-            display_name = name if name else symbol
-            st.write(display_name[:8] + "..." if len(display_name) > 8 else display_name)
-            if is_turning:
-                st.caption("🔥")
-        
-        with row_cols[2]:
+        # Left: Stock info compact display
+        with main_cols[0]:
+            info_parts = [f"**{symbol}**"]
+            if name:
+                info_parts.append(name[:10])
             if last_price:
-                st.write(f"¥{last_price:.2f}")
-            else:
-                st.caption("--")
-        
-        with row_cols[3]:
-            if last_change_pct:
-                color = "#4CAF50" if last_change_pct > 0 else "#F44336" if last_change_pct < 0 else "#9E9E9E"
-                sign = "+" if last_change_pct > 0 else ""
-                st.markdown(f"<span style='color: {color}'>{sign}{last_change_pct:.1f}%</span>", unsafe_allow_html=True)
-            else:
-                st.caption("--")
-        
-        with row_cols[4]:
+                color = "#4CAF50" if last_change_pct and last_change_pct > 0 else "#F44336"
+                sign = "+" if last_change_pct and last_change_pct > 0 else ""
+                info_parts.append(f"¥{last_price:.2f}")
+                if last_change_pct:
+                    info_parts.append(f"<span style='color:{color}'>{sign}{last_change_pct:.1f}%</span>")
+            
+            st.markdown(" | ".join(info_parts), unsafe_allow_html=True)
+            
             signal_color = get_signal_color(last_signal)
             signal_text = format_signal(last_signal, last_confidence)
-            st.markdown(f"<span style='color: {signal_color}; font-weight: bold;'>{signal_text}</span>", unsafe_allow_html=True)
+            next_text = get_next_analysis_text(is_high_freq, high_freq_until, item.get('last_analysis_at'))
+            st.markdown(f"<small>{signal_text} | {next_text} {'🔥' if is_turning else ''}</small>", unsafe_allow_html=True)
         
-        with row_cols[5]:
-            last_analysis_at = item.get('last_analysis_at')
-            next_analysis = get_next_analysis_text(is_high_freq, high_freq_until, last_analysis_at)
-            next_color = "#F44336" if "变盘" in next_analysis else "#2196F3" if "高频" in next_analysis else "#9E9E9E"
-            st.markdown(f"<span style='color: {next_color}'>{next_analysis}</span>", unsafe_allow_html=True)
-        
-        with row_cols[6]:
-            if st.button("👁️", key=f"view_stock_{stock_id}", help="查看详情"):
-                st.session_state.selected_stock = item
-                st.session_state.show_stock_detail = True
-        
-        with row_cols[7]:
-            # Three-button analysis layout: 全量 / 增量 / 差异
-            force_refresh = st.checkbox(
-                "强刷",
-                key=f"force_refresh_{stock_id}",
-                help="忽略缓存，重新执行全部分析",
-            )
-            btn_cols = st.columns([0.7, 0.7, 0.7])
-
-            # Compute button states (N+1优化: 使用批量查询结果)
+        # Right: All action buttons in ONE horizontal row (8 buttons)
+        with main_cols[1]:
+            # Compute states
             _sym_status = status_batch.get(symbol, {})
             is_analyzing = _sym_status.get("is_analyzing", False)
             has_full_today = _sym_status.get("has_full_analysis_today", False)
             has_multiple = _sym_status.get("has_multiple_analyses", False)
-
-            # 乐观更新: 如果用户刚触发了分析，立即显示为running
-            optimistic = st.session_state.get("optimistic_analysis_state", {}).get(symbol)
-            if optimistic == "running":
+            if st.session_state.get("optimistic_analysis_state", {}).get(symbol) == "running":
                 is_analyzing = True
-
-            full_disabled = is_analyzing
-            incr_disabled = not has_full_today or is_analyzing
-            diff_disabled = not has_multiple or is_analyzing
-
-            with btn_cols[0]:
-                if full_disabled:
-                    st.button(
-                        "全量",
-                        key=f"full_btn_{stock_id}",
-                        disabled=True,
-                        help="分析正在运行中" if is_analyzing else "",
-                    )
+            # Clear stale optimistic state once API confirms not analyzing
+            if not is_analyzing and st.session_state.get("optimistic_analysis_state", {}).get(symbol):
+                st.session_state.get("optimistic_analysis_state", {}).pop(symbol, None)
+            
+            # All 8 buttons in ONE row - no vertical stacking
+            btn_cols = st.columns([0.8, 1, 1, 1, 1, 0.8, 0.8, 0.8])
+            
+            with btn_cols[0]:  # View
+                if st.button("👁️", key=f"view_{stock_id}", help="查看"):
+                    st.session_state.selected_stock = item
+                    st.session_state.show_stock_detail = True
+            
+            with btn_cols[1]:  # Force refresh checkbox (compact)
+                st.checkbox("☐", key=f"fr_{stock_id}", help="强刷", label_visibility="collapsed")
+            
+            with btn_cols[2]:  # Full analysis
+                if is_analyzing:
+                    st.button("📊", key=f"full_{stock_id}", disabled=True, help="⏳ 分析中，请等待完成")
                 else:
-                    if st.button("全量", key=f"full_btn_{stock_id}", help="启动全量分析"):
-                        # 乐观更新: 立即标记为running
+                    if st.button("📊", key=f"full_{stock_id}", help="全量分析"):
                         st.session_state.setdefault("optimistic_analysis_state", {})[symbol] = "running"
-                        try:
-                            with st.spinner("全量分析中..."):
-                                result = trigger_full_analysis(symbol, force_refresh=force_refresh)
-                            if result:
-                                st.success("全量分析已启动")
-                                invalidate_batch_status_cache([symbol])
-                                st.rerun()
-                            else:
-                                st.session_state.get("optimistic_analysis_state", {}).pop(symbol, None)
-                                st.error("分析启动失败")
-                                st.rerun()
-                        except Exception as e:
+                        result = trigger_full_analysis(symbol, st.session_state.get(f"fr_{stock_id}", False))
+                        if result:
+                            invalidate_batch_status_cache([symbol])
+                            st.toast(f"🚀 {symbol} 全量分析已启动", icon="✅")
+                        else:
+                            # Failed - clear optimistic state so button re-enables
                             st.session_state.get("optimistic_analysis_state", {}).pop(symbol, None)
-                            st.error(f"分析启动失败: {str(e)}")
-
-            with btn_cols[1]:
-                incr_help = "需先完成今日全量分析" if not has_full_today else ("分析正在运行中" if is_analyzing else "启动增量分析")
-                if st.button("增量", key=f"incr_btn_{stock_id}", disabled=incr_disabled, help=incr_help):
-                    trigger_incremental_analysis(stock_id, symbol)
-
-            with btn_cols[2]:
-                diff_help = "需要至少两次分析记录" if not has_multiple else ("分析正在运行中" if is_analyzing else "查看分析差异")
-                if st.button("差异", key=f"diff_btn_{stock_id}", disabled=diff_disabled, help=diff_help):
-                    with st.spinner("生成差异报告..."):
-                        report = fetch_diff_report(symbol)
-                    st.session_state.diff_report_data = report
+                        st.rerun()
+            
+            with btn_cols[3]:  # Incremental
+                incr_disabled = not has_full_today or is_analyzing
+                if incr_disabled:
+                    incr_reason = "⏳ 分析中" if is_analyzing else "❗ 请先完成全量分析"
+                else:
+                    incr_reason = "增量分析"
+                if st.button("🔄", key=f"incr_{stock_id}", disabled=incr_disabled, help=incr_reason):
+                    st.session_state['incr_panel_stock_id'] = stock_id
+                    st.rerun()
+            
+            with btn_cols[4]:  # Diff
+                diff_disabled = not has_multiple or is_analyzing
+                if diff_disabled:
+                    diff_reason = "⏳ 分析中" if is_analyzing else "❗ 需要至少2次分析"
+                else:
+                    diff_reason = "差异对比"
+                if st.button("📋", key=f"diff_{stock_id}", disabled=diff_disabled, help=diff_reason):
+                    st.session_state.diff_report_data = fetch_diff_report(symbol)
                     st.session_state.diff_symbol = symbol
                     st.session_state.show_diff_modal = True
                     st.rerun()
-        
-        with row_cols[8]:
-            # Management buttons
-            mgmt_cols = st.columns(3)
-            with mgmt_cols[0]:
-                if st.button("✏️", key=f"edit_stock_{stock_id}", help="编辑"):
+            
+            with btn_cols[5]:  # Edit
+                if st.button("✏️", key=f"edit_{stock_id}", help="编辑"):
                     st.session_state.selected_stock = item
                     st.session_state.show_edit_stock = True
                     st.rerun()
-            with mgmt_cols[1]:
-                if st.button("⚙️", key=f"settings_stock_{stock_id}", help="设置"):
+            
+            with btn_cols[6]:  # Settings
+                if st.button("⚙️", key=f"set_{stock_id}", help="设置"):
                     st.session_state.selected_stock = item
                     st.session_state.show_stock_settings = True
-            with mgmt_cols[2]:
-                # Use a unique key for each delete button confirmation
-                confirm_key = f"confirm_delete_{stock_id}"
-                if confirm_key not in st.session_state:
-                    st.session_state[confirm_key] = False
-                
-                if not st.session_state[confirm_key]:
-                    if st.button("🗑️", key=f"delete_stock_{stock_id}", help="点击删除"):
-                        st.session_state[confirm_key] = True
-                        st.rerun()
-                else:
-                    st.warning(f"确定删除 {symbol}?")
-                    col_yes, col_no = st.columns(2)
-                    with col_yes:
-                        if st.button("✅ 确定", key=f"confirm_yes_{stock_id}"):
+            
+            with btn_cols[7]:  # Delete
+                confirm_key = f"confirm_del_{stock_id}"
+                if st.session_state.get(confirm_key):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✅", key=f"y_{stock_id}"):
                             if delete_watchlist_stock(stock_id):
                                 st.session_state[confirm_key] = False
-                                # Optimistic update: immediately remove from cache & local state
                                 load_watchlist.clear()
-                                st.toast(f"✅ 已删除 {symbol}", icon="🗑️")
                                 st.rerun()
-                    with col_no:
-                        if st.button("❌ 取消", key=f"confirm_no_{stock_id}"):
+                    with c2:
+                        if st.button("❌", key=f"n_{stock_id}"):
                             st.session_state[confirm_key] = False
+                            st.rerun()
+                else:
+                    if st.button("🗑️", key=f"del_{stock_id}", help="删除"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
         
         if is_turning or importance_high:
             st.markdown("</div>", unsafe_allow_html=True)
-        
         st.divider()
 
 
@@ -2760,6 +2630,12 @@ def render_diff_modal() -> None:
 def render_watchlist_manager():
     """Main entry point for watchlist management page."""
     try:
+        # Display deferred analysis errors (stored by trigger_full_analysis)
+        _errors = st.session_state.pop("_analysis_errors", {})
+        if _errors:
+            for _sym, _msg in _errors.items():
+                st.error(f"**{_sym}** {_msg}")
+        
         st.title("📊 自选股实时监控")
         st.caption("AI驱动变盘检测")
         
@@ -2778,6 +2654,11 @@ def render_watchlist_manager():
         
         # --- Watchlist table ---
         render_watchlist_table()
+        
+        # --- Incremental analysis panel (full-width, rendered outside table) ---
+        watchlist = st.session_state.get('watchlist_data', [])
+        if watchlist:
+            render_incremental_analysis_section(watchlist)
         
         st.divider()
         

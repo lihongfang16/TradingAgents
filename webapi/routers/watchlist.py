@@ -14,7 +14,7 @@ import asyncio
 
 from webapi.config.database import get_db
 from webapi.models.database import Watchlist, WatchlistAnalysis, WatchlistConfig, AnalysisTask
-from webapi.models.analysis import AnalysisRequest, AnalysisResponse, StockExchange, AnalysisHistoryResponse, AnalysisHistoryItem
+from webapi.models.analysis import AnalysisRequest, AnalysisResponse, StockExchange, AnalysisHistoryResponse, AnalysisHistoryItem, SignalType
 
 # Lazy import analysis_service to avoid slow startup
 def get_analysis_service():
@@ -881,7 +881,8 @@ async def incremental_analyze_precheck(
 
     # Check full analysis exists today (matches IncrementalAnalysisService logic)
     # NOTE: Use range query instead of func.date() to ensure index usage
-    today = date.today()
+    # NOTE: Use UTC date to match WatchlistAnalysis.created_at (stored in UTC)
+    today = datetime.utcnow().date()
     today_start = datetime.combine(today, datetime.min.time())
     tomorrow_start = datetime.combine(today + timedelta(days=1), datetime.min.time())
     full_today = db.query(WatchlistAnalysis).filter(
@@ -988,9 +989,14 @@ async def get_analysis_history(
 
     items: List[AnalysisHistoryItem] = []
     for analysis in analyses:
+        # Skip records with invalid/unknown signal values that aren't in SignalType enum
+        try:
+            signal = SignalType(analysis.signal)
+        except ValueError:
+            continue
         items.append(AnalysisHistoryItem(
             timestamp=analysis.completed_at or analysis.created_at,
-            signal=analysis.signal,
+            signal=signal,
             confidence=float(analysis.confidence) if analysis.confidence else None,
             price=analysis.price,
             error_message=analysis.error_message,

@@ -89,7 +89,8 @@ class IncrementalAnalysisService:
 
         # ── Step 1: Check for full analysis today ─────────────────────
         # NOTE: Use range query instead of func.date() to ensure index usage
-        today = date.today()
+        # NOTE: Use UTC date to match WatchlistAnalysis.created_at (stored in UTC)
+        today = datetime.utcnow().date()
         today_start = datetime.combine(today, datetime.min.time())
         tomorrow_start = datetime.combine(today + timedelta(days=1), datetime.min.time())
         full_today = self.db.query(WatchlistAnalysis).filter(

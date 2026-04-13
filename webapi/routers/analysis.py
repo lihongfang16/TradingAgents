@@ -18,16 +18,13 @@ from webapi.models.analysis import (
     DiffReportRequest,
     DiffReportResponse,
 )
+from webapi.config.database import SessionLocal
+
 # Lazy import to avoid slow startup
 def get_analysis_service():
     from webapi.services.analysis_service import analysis_service
     return analysis_service
 
-
-def _get_db():
-    """Return the get_db generator for FastAPI Depends."""
-    from webapi.config.database import get_db as _get_db_gen
-    return _get_db_gen
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
@@ -40,6 +37,31 @@ router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 async def create_analysis(request: AnalysisRequest):
     """Create a new analysis task and enqueue it for worker processing."""
     return await get_analysis_service().run_analysis(str(uuid.uuid4()), request)
+
+
+@router.post("/diff-report")
+async def diff_report(request: DiffReportRequest):
+    """Generate a diff report comparing two analysis tasks."""
+    from webapi.services.diff_report import DiffReportGenerator
+    from webapi.models.database import AnalysisTask
+    
+    db = SessionLocal()
+    try:
+        task1 = db.query(AnalysisTask).filter(AnalysisTask.task_id == request.task_id_1).first()
+        if not task1:
+            raise HTTPException(status_code=404, detail=f"Task not found: {request.task_id_1}")
+        
+        task2 = db.query(AnalysisTask).filter(AnalysisTask.task_id == request.task_id_2).first()
+        if not task2:
+            raise HTTPException(status_code=404, detail=f"Task not found: {request.task_id_2}")
+        
+        generator = DiffReportGenerator()
+        report = generator.generate(request.task_id_1, request.task_id_2, db)
+        
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=report)
+    finally:
+        db.close()
 
 
 @router.get("/{task_id}", response_model=AnalysisResponse)
@@ -74,50 +96,6 @@ async def batch_analysis(request: BatchAnalysisRequest):
     """Create and run batch analysis for multiple symbols"""
     # Use run_batch which creates tasks AND starts execution
     return await get_analysis_service().run_batch(request)
-
-
-@router.post("/diff-report", response_model=DiffReportResponse)
-async def diff_report(request: DiffReportRequest, db: Session = Depends(_get_db)):
-    """Generate a diff report comparing two analysis tasks.
-    
-    Validates that both tasks exist and are COMPLETED before generating the diff.
-    """
-    # Import here to avoid circular imports
-    from webapi.services.diff_report import DiffReportGenerator
-    from webapi.models.database import AnalysisTask
-    
-    # Validate task 1 exists
-    task1 = db.query(AnalysisTask).filter(AnalysisTask.task_id == request.task_id_1).first()
-    if task1 is None:
-        raise HTTPException(status_code=404, detail=f"Task not found: {request.task_id_1}")
-    
-    # Validate task 2 exists
-    task2 = db.query(AnalysisTask).filter(AnalysisTask.task_id == request.task_id_2).first()
-    if task2 is None:
-        raise HTTPException(status_code=404, detail=f"Task not found: {request.task_id_2}")
-    
-    # Validate both tasks are COMPLETED
-    if str(task1.status) != AnalysisStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Task {request.task_id_1} is not completed (status: {task1.status})"
-        )
-    
-    if str(task2.status) != AnalysisStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Task {request.task_id_2} is not completed (status: {task2.status})"
-        )
-    
-    # Generate diff report
-    try:
-        generator = DiffReportGenerator()
-        report = generator.generate(request.task_id_1, request.task_id_2, db)
-        return report
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error generating diff report: {str(e)}")
 
 
 @router.get("/{task_id}/progress")
