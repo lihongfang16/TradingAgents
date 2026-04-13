@@ -22,6 +22,25 @@ from .watchlist_manager_incremental import render_incremental_analysis_section
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:8002")
 
 
+# ---------------------------------------------------------------------------
+# Non-blocking auto-refresh fragment (Streamlit 1.33+ st.fragment)
+# Replaces the old time.sleep(30) approach that blocked the entire UI.
+# ---------------------------------------------------------------------------
+
+@st.fragment(run_every="30s")
+def _render_auto_refresh_fragment():
+    """Background fragment that periodically reloads watchlist data.
+
+    When the watchlist data changes, it silently updates session state so
+    the next full rerun picks up fresh data.  Because this runs inside a
+    ``st.fragment``, it does **not** block the main page – users can click
+    buttons instantly.
+    """
+    watchlist_data = load_watchlist()
+    if watchlist_data != st.session_state.get('watchlist_data', []):
+        st.session_state.watchlist_data = watchlist_data
+
+
 def get_stock_intraday_data(symbol: str) -> Optional[pd.DataFrame]:
     """Get intraday price data for a stock.
 
@@ -2693,18 +2712,11 @@ def render_watchlist_manager():
         if st.session_state.get('show_diff_modal'):
             render_diff_modal()
         
-        # --- Auto-refresh logic ---
+        # --- Auto-refresh logic (non-blocking via st.fragment) ---
         if st.session_state.get('auto_refresh', True):
-            # Use a shorter delay and incremental refresh
-            time.sleep(30)  # Refresh every 30 seconds
             st.session_state.refresh_alerts = True
-            # Update last refresh timestamp
             st.session_state.watchlist_last_update = datetime.utcnow().strftime("%H:%M:%S")
-            # Only reload watchlist data, not full rerun if possible
-            watchlist_data = load_watchlist()
-            if watchlist_data != st.session_state.get('watchlist_data', []):
-                st.session_state.watchlist_data = watchlist_data
-                st.rerun()
+            _render_auto_refresh_fragment()
             
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
