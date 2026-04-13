@@ -942,21 +942,41 @@ def render_history_detail(task_id: str):
         progress_pct = int(result_data.get("progress_pct", 0) or 0) if isinstance(result_data, dict) else 0
         progress_indeterminate = bool(result_data.get("is_progress_indeterminate")) if isinstance(result_data, dict) else False
 
+        # Inject compact typography styles for tab/expander content
+        st.markdown("""<style>
+            .stTabContent h1 { font-size: 1.1rem !important; font-weight: 700; margin-top: 0.5rem; margin-bottom: 0.25rem; }
+            .stTabContent h2 { font-size: 1.0rem !important; font-weight: 600; margin-top: 0.4rem; margin-bottom: 0.2rem; }
+            .stTabContent h3 { font-size: 0.9rem !important; font-weight: 600; margin-top: 0.3rem; margin-bottom: 0.15rem; }
+            .stTabContent h4 { font-size: 0.85rem !important; font-weight: 600; margin-top: 0.3rem; margin-bottom: 0.15rem; }
+            .stTabContent p { font-size: 0.85rem !important; line-height: 1.5; margin-bottom: 0.3rem; }
+            .stTabContent li { font-size: 0.85rem !important; line-height: 1.4; }
+            .stTabContent ul, .stTabContent ol { margin-top: 0.2rem; margin-bottom: 0.3rem; }
+            .stTabContent table { font-size: 0.8rem !important; }
+            .stTabContent th { font-size: 0.8rem !important; padding: 4px 8px !important; }
+            .stTabContent td { font-size: 0.8rem !important; padding: 4px 8px !important; }
+            .stExpander h1, .stExpander h2, .stExpander h3, .stExpander h4 { font-size: 0.85rem !important; font-weight: 600; margin-top: 0.2rem; margin-bottom: 0.15rem; }
+            .stExpander p { font-size: 0.8rem !important; line-height: 1.4; margin-bottom: 0.2rem; }
+            .stExpander li { font-size: 0.8rem !important; line-height: 1.3; }
+        </style>""", unsafe_allow_html=True)
+
         name = _get_stock_name(symbol)
         if name:
             st.markdown(
-                f"## 📊 {symbol} <span style='font-size:0.85rem;color:#6B7280;'>({name})</span> 分析详情",
+                f"<h4 style='margin:0 0 0.25rem 0;font-size:1.2rem;font-weight:700;'>📊 {symbol} <span style='font-size:0.75rem;color:#6B7280;font-weight:400;'>({name})</span> 分析详情</h4>",
                 unsafe_allow_html=True,
             )
         else:
-            st.header(f"📊 {symbol} 分析详情")
+            st.markdown(
+                f"<h4 style='margin:0 0 0.25rem 0;font-size:1.2rem;font-weight:700;'>📊 {symbol} 分析详情</h4>",
+                unsafe_allow_html=True,
+            )
         st.caption(f"📅 {date_str} | {status_icon} {status_text}")
 
         st.divider()
 
         # Real-time progress section (only for PENDING/RUNNING tasks)
         if status in ("PENDING", "RUNNING"):
-            st.subheader("🔄 实时分析进度")
+            st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>🔄 实时分析进度</div>", unsafe_allow_html=True)
             agents_progress = result_data.get("agents_progress", {})
 
             st.progress(progress_pct / 100, text=f"整体进度: {progress_pct}%")
@@ -1006,14 +1026,14 @@ def render_history_detail(task_id: str):
 
             col1, col2, col3 = st.columns([1, 1, 1])
             with col1:
-                st.subheader("📈 交易建议")
+                st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>📈 交易建议</div>", unsafe_allow_html=True)
                 if analysis_error:
                     st.error("❌ 分析失败")
                 else:
                     decision_text, color = DECISION_TEXT_MAP.get(decision, (decision, "gray"))
-                    st.markdown(f"### <span style='color: {color}'>{decision_text}</span>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size:1.3rem;font-weight:700;color:{color};margin:0.25rem 0;'>{decision_text}</div>", unsafe_allow_html=True)
             with col2:
-                st.subheader("📊 置信度")
+                st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>📊 置信度</div>", unsafe_allow_html=True)
                 if analysis_error:
                     with st.expander("查看错误详情"):
                         st.code(analysis_error, language=None)
@@ -1022,7 +1042,7 @@ def render_history_detail(task_id: str):
                 else:
                     st.info("计算中...")
             with col3:
-                st.subheader("⚠️ 风险等级")
+                st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>⚠️ 风险等级</div>", unsafe_allow_html=True)
                 if analysis_error:
                     st.write("未知")
                 elif risk_level:
@@ -1058,7 +1078,7 @@ def render_history_detail(task_id: str):
 
             available_reports = {k: v for k, v in reports.items() if k in final_state_for_tabs and final_state_for_tabs[k]}
             if available_reports:
-                st.subheader("📚 分析报告")
+                st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>📚 分析报告</div>", unsafe_allow_html=True)
                 tabs = st.tabs(list(available_reports.values()))
                 for i, (tab, (report_key, report_name)) in enumerate(zip(tabs, available_reports.items())):
                     with tab:
@@ -1093,7 +1113,7 @@ def render_history_detail(task_id: str):
 
         # Show summary as markdown if available (outside tabs)
         if summary:
-            st.subheader("📋 分析摘要")
+            st.markdown("<div style='font-size:0.9rem;font-weight:600;color:#374151;margin-bottom:0.5rem;'>📋 分析摘要</div>", unsafe_allow_html=True)
             st.markdown(summary)
 
         # Show technical indicators if available
