@@ -26,7 +26,7 @@ DEFAULT_CONFIG = {
     # Timeout and retry configuration
     "llm_nodata_timeout_seconds": 120,  # Timeout if no data received for 120s
     "llm_max_retries": 2,                # LangChain max retries for API errors
-    "analysis_timeout_seconds": 900,     # Worker task timeout (15 minutes)
+    "analysis_timeout_seconds": 1800,    # Worker task timeout (30 minutes, accounts for persona agents)
     # Persona agent configuration
     "enable_personas": True,             # Enable 6 investor persona agents (Buffett, Burry, Taleb, etc.)
     # Data vendor configuration

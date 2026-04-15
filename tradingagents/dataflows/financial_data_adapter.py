@@ -10,12 +10,17 @@ avoiding duplicate AkShare API calls via a simple dict cache keyed by
 """
 
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import pandas as pd
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Maximum seconds to wait for a single AkShare API call before giving up.
+# Prevents proxy/network issues from blocking the entire analysis pipeline.
+_API_CALL_TIMEOUT_SECONDS = 30
 
 
 # ── Column name mappings (Chinese → English) ──────────────────────────
@@ -120,6 +125,24 @@ class FinancialDataAdapter:
 
     # ── Helpers ───────────────────────────────────────────────────
 
+    def _call_with_timeout(self, fn, *args, **kwargs) -> Any:
+        """Call an AkShare API function with a timeout to prevent blocking.
+
+        AkShare internally uses ``requests`` without exposing timeout params,
+        so we run the call in a thread and enforce our own deadline.
+        """
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args, **kwargs)
+            try:
+                return future.result(timeout=_API_CALL_TIMEOUT_SECONDS)
+            except FuturesTimeoutError:
+                logger.warning(
+                    "FinancialDataAdapter: API call %s timed out after %ds",
+                    getattr(fn, "__name__", "unknown"),
+                    _API_CALL_TIMEOUT_SECONDS,
+                )
+                return None
+
     @staticmethod
     def _convert_symbol(symbol: str) -> str:
         """Normalize symbol to 6-digit string (matches AkShareProvider)."""
@@ -184,7 +207,8 @@ class FinancialDataAdapter:
             return {}
 
         try:
-            df: pd.DataFrame = self._ak.stock_financial_analysis_indicator_em(
+            df: pd.DataFrame = self._call_with_timeout(
+                self._ak.stock_financial_analysis_indicator_em,
                 symbol=symbol,
             )
 
@@ -258,7 +282,8 @@ class FinancialDataAdapter:
             return {}
 
         try:
-            df: pd.DataFrame = self._ak.stock_profit_sheet_by_report_em(
+            df: pd.DataFrame = self._call_with_timeout(
+                self._ak.stock_profit_sheet_by_report_em,
                 symbol=symbol,
             )
 
@@ -307,7 +332,8 @@ class FinancialDataAdapter:
             return {}
 
         try:
-            df: pd.DataFrame = self._ak.stock_balance_sheet_by_report_em(
+            df: pd.DataFrame = self._call_with_timeout(
+                self._ak.stock_balance_sheet_by_report_em,
                 symbol=symbol,
             )
 
@@ -358,7 +384,8 @@ class FinancialDataAdapter:
             return {}
 
         try:
-            df: pd.DataFrame = self._ak.stock_cash_flow_sheet_by_report_em(
+            df: pd.DataFrame = self._call_with_timeout(
+                self._ak.stock_cash_flow_sheet_by_report_em,
                 symbol=symbol,
             )
 
