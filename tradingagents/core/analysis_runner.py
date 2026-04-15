@@ -701,6 +701,11 @@ class AnalysisRunner:
                     )
                 slim_state[debate_key] = {"judge_decision": judge_decision}
 
+        # Extract persona_signals (per-persona signal/confidence/reasoning)
+        persona_signals = serialized.get("persona_signals")
+        if isinstance(persona_signals, dict) and persona_signals:
+            slim_state["persona_signals"] = persona_signals
+
         return slim_state
 
     def _classify_error(self, exception: Exception) -> str:

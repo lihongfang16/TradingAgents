@@ -1099,6 +1099,8 @@ def render_history_detail(task_id: str):
                     "sentiment_analyst": "💭 情绪分析师",
                     "news_analyst": "📰 新闻分析师",
                     "fundamentals_analyst": "🏢 基本面分析师",
+                    "market_index_analyst": "📈 大盘分析师",
+                    "persona_agents": "🎭 投资大师人设分析",
                     "bull_researcher": "🐂 看涨研究员",
                     "bear_researcher": "🐻 看跌研究员",
                     "research_manager": "🔍 研究经理",
@@ -1110,6 +1112,56 @@ def render_history_detail(task_id: str):
                     if content and isinstance(content, str) and content.strip():
                         with st.expander(display_name):
                             st.markdown(content)
+
+        # Show individual persona signals if available
+        persona_signals = None
+        if api_data and api_data.get("result", {}).get("final_state", {}).get("persona_signals"):
+            persona_signals = api_data["result"]["final_state"]["persona_signals"]
+        elif result_data and result_data.get("final_state", {}).get("persona_signals"):
+            persona_signals = result_data["final_state"]["persona_signals"]
+
+        if persona_signals and isinstance(persona_signals, dict):
+            persona_display_names = {
+                "warren_buffett": ("🎩 沃伦·巴菲特", "价值投资"),
+                "michael_burry": ("🔍 迈克尔·布瑞", "深度价值/逆向"),
+                "nassim_taleb": ("🎲 纳西姆·塔勒布", "尾部风险/反脆弱"),
+                "stanley_druckenmiller": ("🌍 斯坦利·德鲁肯米勒", "宏观趋势/动量"),
+                "cathie_wood": ("🚀 凯瑟琳·伍德", "颠覆式创新"),
+                "charlie_munger": ("🏛️ 查理·芒格", "护城河/思维模型"),
+            }
+            with st.expander("🎭 投资大师人设评估", expanded=False):
+                st.caption("6 位投资大师基于量化数据和人设理念的独立评估")
+                # Summary row
+                bullish = sum(1 for s in persona_signals.values() if isinstance(s, dict) and s.get("signal") == "bullish")
+                bearish = sum(1 for s in persona_signals.values() if isinstance(s, dict) and s.get("signal") == "bearish")
+                neutral = sum(1 for s in persona_signals.values() if isinstance(s, dict) and s.get("signal") == "neutral")
+                avg_conf = 0
+                conf_count = 0
+                for s in persona_signals.values():
+                    if isinstance(s, dict) and s.get("confidence"):
+                        avg_conf += s["confidence"]
+                        conf_count += 1
+                if conf_count > 0:
+                    avg_conf = avg_conf // conf_count
+                signal_color = "🔴" if bearish > bullish else ("🟢" if bullish > bearish else "🟡")
+                st.markdown(f"**投票汇总**: {signal_color} 看涨 {bullish}/6 | 看跌 {bearish}/6 | 中性 {neutral}/6 | 平均置信度 {avg_conf}/100")
+                st.divider()
+                # Individual persona cards
+                cols = st.columns(3)
+                for idx, (name, (display, philosophy)) in enumerate(persona_display_names.items()):
+                    sig = persona_signals.get(name, {})
+                    if not isinstance(sig, dict):
+                        continue
+                    signal = sig.get("signal", "N/A")
+                    confidence = sig.get("confidence", 0)
+                    reasoning = sig.get("reasoning", "")
+                    signal_emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "🟡"}.get(signal, "⚪")
+                    with cols[idx % 3]:
+                        st.markdown(f"**{display}**")
+                        st.caption(philosophy)
+                        st.markdown(f"{signal_emoji} **{signal.upper()}** | 置信度: **{confidence}/100**")
+                        if reasoning:
+                            st.markdown(f"<div style='font-size:0.8rem;color:#666;'>{reasoning}</div>", unsafe_allow_html=True)
 
         # Show summary as markdown if available (outside tabs)
         if summary:
