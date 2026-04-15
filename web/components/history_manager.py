@@ -5,7 +5,7 @@ import sys
 import threading
 import traceback
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -13,6 +13,29 @@ import streamlit as st
 # Import unified signal extractor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from webapi.utils.signal_extractor import extract_decision_with_fallback
+
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_utc_dt(dt_str: str) -> Optional[datetime]:
+    """Parse a UTC ISO string into a timezone-aware datetime in China time (+8)."""
+    if not dt_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(CHINA_TZ)
+    except Exception:
+        return None
+
+
+def _format_china_time(dt_str: str, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a UTC ISO string for China timezone display."""
+    dt = _parse_utc_dt(dt_str)
+    if dt is None:
+        return dt_str[:16] if len(dt_str) > 16 else dt_str
+    return dt.strftime(fmt)
 
 
 def _extract_from_api_task(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -428,14 +451,16 @@ def get_task_progress(task_id: str) -> Optional[Dict[str, Any]]:
                 elapsed = 0
                 if created_at and updated_at:
                     try:
-                        start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                        end_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                        elapsed = (end_dt.replace(tzinfo=None) - start_dt.replace(tzinfo=None)).total_seconds()
+                        start_dt = _parse_utc_dt(created_at)
+                        end_dt = _parse_utc_dt(updated_at)
+                        if start_dt and end_dt:
+                            elapsed = (end_dt - start_dt).total_seconds()
                     except:
                         # Fallback: use created_at to now
                         try:
-                            start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                            elapsed = (datetime.now() - start_dt.replace(tzinfo=None)).total_seconds()
+                            start_dt = _parse_utc_dt(created_at)
+                            if start_dt:
+                                elapsed = (datetime.now(CHINA_TZ) - start_dt).total_seconds()
                         except:
                             pass
                 return {
@@ -467,8 +492,9 @@ def get_task_progress(task_id: str) -> Optional[Dict[str, Any]]:
             elapsed = 0
             if created_at:
                 try:
-                    start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    elapsed = (datetime.now() - start_dt.replace(tzinfo=None)).total_seconds()
+                    start_dt = _parse_utc_dt(created_at)
+                    if start_dt:
+                        elapsed = (datetime.now(CHINA_TZ) - start_dt).total_seconds()
                 except:
                     pass
             
@@ -534,12 +560,14 @@ def extract_task_timing(task: Dict[str, Any], result_data: Optional[Dict[str, An
         updated_at = task.get("updated_at", "")
         if created_at:
             try:
-                start_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00')).replace(tzinfo=None)
-                if updated_at and task.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
-                    end_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00')).replace(tzinfo=None)
-                else:
-                    end_dt = datetime.now()
-                elapsed = max(0, int((end_dt - start_dt).total_seconds()))
+                start_dt = _parse_utc_dt(created_at)
+                if start_dt:
+                    if updated_at and task.get("status") in ("COMPLETED", "FAILED", "CANCELLED"):
+                        end_dt = _parse_utc_dt(updated_at)
+                    else:
+                        end_dt = datetime.now(CHINA_TZ)
+                    if end_dt:
+                        elapsed = max(0, int((end_dt - start_dt).total_seconds()))
             except Exception:
                 elapsed = 0
 
@@ -679,12 +707,8 @@ def render_history_manager() -> Optional[str]:
             if not isinstance(raw_result, dict):
                 raw_result = {}
 
-            # Format date
-            try:
-                dt = datetime.fromisoformat(created_at)
-                date_str = dt.strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                date_str = created_at[:16] if created_at else "Unknown"
+            # Format date in China timezone (+8)
+            date_str = _format_china_time(created_at, "%Y-%m-%d %H:%M")
 
             # Card layout: 4 columns [2, 2, 1.5, 1.5]
             col1, col2, col3, col4 = st.columns([2, 2, 1.5, 1.5])
@@ -926,12 +950,8 @@ def render_history_detail(task_id: str):
             confidence = confidence or record.get("confidence", 0)
             reasoning = reasoning or record.get("reasoning", "")
 
-        # Format date
-        try:
-            dt = datetime.fromisoformat(created_at)
-            date_str = dt.strftime("%Y年%m月%d日 %H:%M")
-        except Exception:
-            date_str = created_at
+        # Format date in China timezone (+8)
+        date_str = _format_china_time(created_at, "%Y年%m月%d日 %H:%M")
 
         status_icon, status_text, _ = STATUS_CONFIG.get(status, ("⚪", status or "未知", "#9E9E9E"))
         elapsed_time, remaining_time = extract_task_timing(

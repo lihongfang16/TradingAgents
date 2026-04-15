@@ -8,11 +8,34 @@ import traceback
 import time
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from socket import timeout as SocketTimeout
 
 import streamlit as st
+
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_utc_dt(dt_str: str) -> Optional[datetime]:
+    """Parse a UTC ISO string into a timezone-aware datetime in China time (+8)."""
+    if not dt_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(CHINA_TZ)
+    except Exception:
+        return None
+
+
+def _format_china_time(dt_str: str, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a UTC ISO string for China timezone display."""
+    dt = _parse_utc_dt(dt_str)
+    if dt is None:
+        return dt_str[:16] if len(dt_str) > 16 else dt_str
+    return dt.strftime(fmt)
 
 # Import incremental analysis panel renderer
 from .watchlist_manager_incremental import render_incremental_analysis_section
@@ -2061,12 +2084,8 @@ def render_monitoring_panel():
         with col4:
             last_analysis_at = selected_item.get('last_analysis_at')
             if last_analysis_at:
-                try:
-                    dt = datetime.fromisoformat(last_analysis_at.replace('Z', '+00:00'))
-                    time_str = dt.strftime("%H:%M")
-                    st.metric("最后分析", time_str)
-                except:
-                    st.metric("最后分析", "--")
+                time_str = _format_china_time(last_analysis_at, "%H:%M")
+                st.metric("最后分析", time_str)
             else:
                 st.metric("最后分析", "--")
         
@@ -2113,11 +2132,7 @@ def render_monitoring_panel():
                 price = clicked_signal.get('price')
                 ts = clicked_signal.get('timestamp', '')
                 sig_color = get_signal_color(sig)
-                try:
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                    time_str = dt.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    time_str = ts[:16] if ts else ""
+                time_str = _format_china_time(ts, "%Y-%m-%d %H:%M")
                 price_str = f"¥{price:.2f}" if price else "--"
                 st.markdown(
                     f'<div style="background:rgba(33,150,243,0.08);border:1px solid #2196F3;'
@@ -2328,15 +2343,7 @@ def render_stock_detail_modal():
                                 err = selected_rec.get("error_message")
                                 sig_color = get_signal_color(sig)
                                 
-                                time_str = ""
-                                if ts:
-                                    try:
-                                        dt = datetime.fromisoformat(
-                                            ts.replace('Z', '+00:00')
-                                        )
-                                        time_str = dt.strftime("%m/%d %H:%M")
-                                    except Exception:
-                                        time_str = ts[:16]
+                                time_str = _format_china_time(ts, "%m/%d %H:%M") if ts else ""
 
                                 # Display selected record with highlight
                                 border = "border:2px solid #2196F3;border-radius:6px;padding:10px;background:rgba(33,150,243,0.06);margin:8px 0"
@@ -2379,15 +2386,7 @@ def render_stock_detail_modal():
                                 price = rec.get("price")
                                 err = rec.get("error_message")
                                 sig_color = get_signal_color(sig)
-                                time_str = ""
-                                if ts:
-                                    try:
-                                        dt = datetime.fromisoformat(
-                                            ts.replace('Z', '+00:00')
-                                        )
-                                        time_str = dt.strftime("%m/%d %H:%M")
-                                    except Exception:
-                                        time_str = ts[:16]
+                                time_str = _format_china_time(ts, "%m/%d %H:%M") if ts else ""
 
                                 if err:
                                     btn_label = f"❌ {time_str} 分析失败"
