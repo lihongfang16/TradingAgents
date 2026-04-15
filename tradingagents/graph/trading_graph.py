@@ -148,7 +148,11 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Set up the graph
-        self.graph = self.graph_setup.setup_graph(selected_analysts, fast_mode=self.fast_mode)
+        self.graph = self.graph_setup.setup_graph(
+            selected_analysts,
+            fast_mode=self.fast_mode,
+            enable_personas=self.config.get("enable_personas", True),
+        )
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""

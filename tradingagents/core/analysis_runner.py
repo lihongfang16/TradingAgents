@@ -23,6 +23,7 @@ AGENT_STEPS = [
     ("sentiment_analyst", "💭", "情绪分析师"),
     ("news_analyst", "📰", "新闻分析师"),
     ("fundamentals_analyst", "🏢", "基本面分析师"),
+    ("persona_agents", "🎭", "投资者人设分析"),
     ("research_manager", "🔍", "研究经理"),
     ("bull_researcher", "🐂", "看涨研究员"),
     ("bear_researcher", "🐻", "看跌研究员"),
@@ -41,10 +42,18 @@ class AnalysisRunner:
     """
 
     NODE_TO_STEP = {
+        "Market Index Analyst": "market_index_analyst",
         "Market Analyst": "market_analyst",
         "Social Analyst": "sentiment_analyst",
         "News Analyst": "news_analyst",
         "Fundamentals Analyst": "fundamentals_analyst",
+        "Warren Buffett": "persona_agents",
+        "Michael Burry": "persona_agents",
+        "Nassim Taleb": "persona_agents",
+        "Stanley Druckenmiller": "persona_agents",
+        "Cathie Wood": "persona_agents",
+        "Charlie Munger": "persona_agents",
+        "Persona Aggregator": "persona_agents",
         "Research Manager": "research_manager",
         "Quick Risk Check": "risk_manager",
         "Bull Researcher": "bull_researcher",
@@ -54,14 +63,20 @@ class AnalysisRunner:
     }
     RISK_NODES = {"Aggressive Analyst", "Conservative Analyst", "Neutral Analyst"}
     IGNORE_NODES = {
+        "tools_market_index",
         "tools_market",
         "tools_social",
         "tools_news",
         "tools_fundamentals",
+        "Msg Clear Market Index",
         "Msg Clear Market",
         "Msg Clear Social",
         "Msg Clear News",
         "Msg Clear Fundamentals",
+    }
+    PERSONA_NODES = {
+        "Warren Buffett", "Michael Burry", "Nassim Taleb",
+        "Stanley Druckenmiller", "Cathie Wood", "Charlie Munger",
     }
     REPORT_MAX_CHARS = 2000
     SERIALIZE_MAX_DEPTH = 5
@@ -76,10 +91,12 @@ class AnalysisRunner:
 
     # Map LangGraph node names to AgentState report fields
     NODE_TO_REPORT_FIELD = {
+        "Market Index Analyst": "market_index_report",
         "Market Analyst": "market_report",
         "Social Analyst": "sentiment_report",
         "News Analyst": "news_report",
         "Fundamentals Analyst": "fundamentals_report",
+        "Persona Aggregator": "persona_report",
         "Research Manager": "investment_plan",
         "Trader": "trader_investment_plan",
         "Portfolio Manager": "final_trade_decision",
@@ -249,6 +266,7 @@ class AnalysisRunner:
 
         try:
             analyst_mapping = {
+                "market_index": "market_index_analyst",
                 "market": "market_analyst",
                 "sentiment": "sentiment_analyst",
                 "social": "sentiment_analyst",
@@ -264,11 +282,12 @@ class AnalysisRunner:
             completed_analysts = set()
             completed_research = set()
             completed_risk_nodes = set()
+            completed_persona_nodes = set()
             active_steps = {"graph_setup", *configured_analyst_steps, "trader", "portfolio_manager"}
             if self.fast_mode:
                 active_steps.add("risk_manager")
             else:
-                active_steps.update({"research_manager", "bull_researcher", "bear_researcher", "risk_manager"})
+                active_steps.update({"research_manager", "bull_researcher", "bear_researcher", "risk_manager", "persona_agents"})
 
             def emit_progress(current_agent: str, progress_pct: int, message: str) -> None:
                 normalized_progress = max(self._progress_pct, min(progress_pct, 100))
@@ -375,6 +394,23 @@ class AnalysisRunner:
                             agents_progress["risk_manager"] = "completed"
                         emit_progress("risk_manager", min(progress, 94), f"风险辩论节点完成: {node}")
 
+                # Persona agent progress tracking
+                if node in self.PERSONA_NODES or node == "Persona Aggregator":
+                    if node not in completed_persona_nodes:
+                        completed_persona_nodes.add(node)
+                        total_persona = len(self.PERSONA_NODES) + 1  # 6 agents + 1 aggregator
+                        if agents_progress.get("persona_agents") == "not_started":
+                            agents_progress["persona_agents"] = "in_progress"
+                        progress = self._compute_step_progress(
+                            len(completed_persona_nodes),
+                            total_persona,
+                            55,
+                            60,
+                        )
+                        if len(completed_persona_nodes) == total_persona:
+                            agents_progress["persona_agents"] = "completed"
+                        emit_progress("persona_agents", min(progress, 60), f"Persona 节点完成: {node}")
+
             final_state, signal = graph_obj.propagate(
                 self.symbol,
                 self.date,
@@ -474,10 +510,12 @@ class AnalysisRunner:
 
         # Map step_id (display name) to state field names
         STREAM_FIELD_MAP = {
+            "market_index_analyst": "market_index_report",
             "market_analyst": "market_report",
             "sentiment_analyst": "sentiment_report",
             "news_analyst": "news_report",
             "fundamentals_analyst": "fundamentals_report",
+            "persona_agents": "persona_report",
             "research_manager": "investment_plan",
             "trader": "trader_investment_plan",
             "portfolio_manager": "final_trade_decision",
@@ -640,6 +678,8 @@ class AnalysisRunner:
             "sentiment_report",
             "news_report",
             "fundamentals_report",
+            "market_index_report",
+            "persona_report",
         ]:
             report_value = serialized.get(report_key)
             if report_value is not None:

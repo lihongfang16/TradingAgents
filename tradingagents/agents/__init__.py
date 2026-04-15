@@ -23,6 +23,16 @@ from .managers.portfolio_manager import create_portfolio_manager
 
 from .trader.trader import create_trader
 
+from .personas import (
+    create_warren_buffett,
+    create_michael_burry,
+    create_nassim_taleb,
+    create_stanley_druckenmiller,
+    create_cathie_wood,
+    create_charlie_munger,
+    create_persona_aggregator,
+)
+
 __all__ = [
     "FinancialSituationMemory",
     "AgentState",
@@ -43,4 +53,11 @@ __all__ = [
     "create_social_media_analyst",
     "create_trader",
     "create_quick_risk_check",
+    "create_warren_buffett",
+    "create_michael_burry",
+    "create_nassim_taleb",
+    "create_stanley_druckenmiller",
+    "create_cathie_wood",
+    "create_charlie_munger",
+    "create_persona_aggregator",
 ]

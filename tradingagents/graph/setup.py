@@ -39,10 +39,58 @@ class GraphSetup:
         self.portfolio_manager_memory = portfolio_manager_memory
         self.conditional_logic = conditional_logic
 
+    def _register_persona_nodes(
+        self,
+        workflow,
+        enable_personas: bool,
+        fast_mode: bool,
+        last_clear_node: str,
+    ) -> str:
+        """Register persona agent nodes and return the name of the last node in the chain.
+
+        If personas are disabled or fast_mode is active, connects ``last_clear_node``
+        directly to "Bull Researcher" (or "Quick Risk Check") and returns that node.
+
+        Otherwise registers 6 persona agents + aggregator with fan-out / fan-in
+        edges and returns "Persona Aggregator".
+        """
+        if fast_mode or not enable_personas:
+            workflow.add_edge(last_clear_node, "Quick Risk Check" if fast_mode else "Bull Researcher")
+            return last_clear_node
+
+        # Create persona agent nodes
+        persona_names = [
+            ("Warren Buffett", create_warren_buffett),
+            ("Michael Burry", create_michael_burry),
+            ("Nassim Taleb", create_nassim_taleb),
+            ("Stanley Druckenmiller", create_stanley_druckenmiller),
+            ("Cathie Wood", create_cathie_wood),
+            ("Charlie Munger", create_charlie_munger),
+        ]
+
+        for display_name, factory in persona_names:
+            workflow.add_node(display_name, factory(self.quick_thinking_llm))
+
+        workflow.add_node("Persona Aggregator", create_persona_aggregator(self.quick_thinking_llm))
+
+        # Fan-out: last analyst → all 6 personas
+        for display_name, _ in persona_names:
+            workflow.add_edge(last_clear_node, display_name)
+
+        # Fan-in: all 6 personas → aggregator
+        for display_name, _ in persona_names:
+            workflow.add_edge(display_name, "Persona Aggregator")
+
+        # Aggregator → Bull Researcher
+        workflow.add_edge("Persona Aggregator", "Bull Researcher")
+
+        return "Persona Aggregator"
+
     def setup_graph(
         self,
         selected_analysts=["market_index", "market", "social", "news", "fundamentals"],
         fast_mode: bool = False,
+        enable_personas: bool = True,
     ):
         """Set up and compile the agent workflow graph.
 
@@ -183,13 +231,17 @@ class GraphSetup:
             )
             workflow.add_edge(current_tools, current_analyst)
 
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
+            # Connect to next analyst or delegate to persona registration
             if i < len(selected_analysts) - 1:
                 next_type = selected_analysts[i + 1]
                 next_analyst = "Market Index Analyst" if next_type == "market_index" else f"{next_type.capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Quick Risk Check" if fast_mode else "Bull Researcher")
+                # Last analyst → persona nodes (or directly to Bull Researcher if personas disabled)
+                last_clear_node = current_clear
+
+        # Register persona agents (or skip edge to Bull Researcher)
+        self._register_persona_nodes(workflow, enable_personas, fast_mode, last_clear_node)
 
         if fast_mode:
             workflow.add_edge("Quick Risk Check", "Trader")

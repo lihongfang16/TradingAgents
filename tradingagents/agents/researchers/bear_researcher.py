@@ -14,6 +14,7 @@ def create_bear_researcher(llm, memory):
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
+        persona_report = state.get("persona_report", "")
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=2)
@@ -38,6 +39,7 @@ def create_bear_researcher(llm, memory):
 社交媒体情绪报告：{sentiment_report}
 最新国际新闻：{news_report}
 公司基本面报告：{fundamentals_report}
+{f"投资者人设投票报告：{persona_report}" if persona_report else ""}
 辩论对话历史：{history}
 看多方最后论点：{current_response}
 类似情况的反思和经验教训：{past_memory_str}

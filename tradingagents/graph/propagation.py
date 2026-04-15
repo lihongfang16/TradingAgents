@@ -51,6 +51,9 @@ class Propagator:
             "fundamentals_report": "",
             "sentiment_report": "",
             "news_report": "",
+            "market_index_report": "",
+            "persona_signals": {},
+            "persona_report": "",
         }
 
     def get_graph_args(self, callbacks: Optional[List] = None, stream_mode: str = "values", version: Optional[str] = None) -> Dict[str, Any]:

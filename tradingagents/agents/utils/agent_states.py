@@ -1,3 +1,4 @@
+import operator
 from typing import Annotated, Sequence
 from datetime import date, timedelta, datetime
 from typing_extensions import TypedDict, Optional
@@ -63,6 +64,10 @@ class AgentState(MessagesState):
 
     # market index analysis step
     market_index_report: Annotated[str, "Report from the Market Index Analyst"]
+
+    # persona agent signals and report
+    persona_signals: Annotated[dict, operator.or_]  # Merge dict outputs from parallel persona agents (fan-in)
+    persona_report: Annotated[str, "Aggregated persona vote summary report"]
 
     # researcher team discussion step
     investment_debate_state: Annotated[
