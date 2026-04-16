@@ -183,6 +183,20 @@ class IncrementalAnalysisService:
         self.db.commit()
 
         try:
+            # Look up position context from watchlist
+            cost_price = None
+            position_shares = None
+            target_position_pct = None
+            if watchlist_id is not None:
+                try:
+                    wl = self.db.query(Watchlist).filter(Watchlist.id == watchlist_id).first()
+                    if wl and wl.cost_price:
+                        cost_price = float(wl.cost_price)
+                        position_shares = int(wl.position_shares) if wl.position_shares else None
+                        target_position_pct = float(wl.target_position_pct) if wl.target_position_pct else None
+                except Exception:
+                    pass  # Non-critical — analysis works without position context
+
             runner = CachedAnalysisRunner(
                 symbol=symbol,
                 date=analysis_date,
@@ -190,6 +204,9 @@ class IncrementalAnalysisService:
                 llm_model=llm_model,
                 llm_provider=llm_provider,
                 cache_service=cache_service,
+                cost_price=cost_price,
+                position_shares=position_shares,
+                target_position_pct=target_position_pct,
             )
             result = runner.run()
 

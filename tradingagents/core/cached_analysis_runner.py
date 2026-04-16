@@ -41,6 +41,9 @@ class CachedAnalysisRunner(AnalysisRunner):
         api_key: Optional[str] = None,
         progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
         fast_mode: bool = False,
+        cost_price: Optional[float] = None,
+        position_shares: Optional[int] = None,
+        target_position_pct: Optional[float] = None,
     ):
         """Initialize cached runner."""
         super().__init__(
@@ -55,6 +58,9 @@ class CachedAnalysisRunner(AnalysisRunner):
             api_key=api_key,
             progress_callback=progress_callback,
             fast_mode=fast_mode,
+            cost_price=cost_price,
+            position_shares=position_shares,
+            target_position_pct=target_position_pct,
         )
         self.cache_service: AnalysisCacheService = cache_service
         self._cached_reports: dict[str, str] = {}

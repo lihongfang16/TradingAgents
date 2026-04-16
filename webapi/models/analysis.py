@@ -63,6 +63,13 @@ class AnalysisResponse(BaseModel):
     # Per-agent LLM output text for post-analysis review
     llm_streams: Optional[Dict[str, Any]] = None
 
+    # Position context from watchlist
+    position_context: Optional[Dict[str, Any]] = None
+
+    # Extracted trading decision and confidence
+    decision: Optional[str] = None  # BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL, UNKNOWN
+    confidence: Optional[int] = None  # 0-100
+
     class Config:
         from_attributes = True
 

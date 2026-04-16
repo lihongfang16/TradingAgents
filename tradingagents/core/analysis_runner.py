@@ -115,6 +115,10 @@ class AnalysisRunner:
         api_key: Optional[str] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         fast_mode: bool = False,
+        cost_price: Optional[float] = None,
+        position_shares: Optional[int] = None,
+        target_position_pct: Optional[float] = None,
+        reference_capital: Optional[float] = None,
     ):
         """
         Initialize the AnalysisRunner.
@@ -131,6 +135,9 @@ class AnalysisRunner:
             api_key: Optional API key for LLM provider
             progress_callback: Optional callback function for progress updates
             fast_mode: If True, skip bull/bear debate nodes for faster analysis (default: False)
+            cost_price: Optional cost basis price per share for position-aware analysis
+            position_shares: Optional number of shares currently held
+            target_position_pct: Optional target portfolio allocation percentage (0.0-1.0)
         """
         self.symbol = symbol
         self.date = date
@@ -143,6 +150,10 @@ class AnalysisRunner:
         self.api_key = api_key
         self.progress_callback = progress_callback
         self.fast_mode = fast_mode
+        self.cost_price = cost_price
+        self.position_shares = position_shares
+        self.target_position_pct = target_position_pct
+        self.reference_capital = reference_capital
         
         # Build config from parameters
         self.config = self._build_config()
@@ -303,6 +314,16 @@ class AnalysisRunner:
             graph_obj = self.graph
             run_state = initial_state or graph_obj.propagator.create_initial_state(self.symbol, self.date)
 
+            # Inject position context if available (from watchlist)
+            if self.cost_price is not None:
+                run_state["cost_price"] = self.cost_price
+            if self.position_shares is not None:
+                run_state["position_shares"] = self.position_shares
+            if self.target_position_pct is not None:
+                run_state["target_position_pct"] = self.target_position_pct
+            if self.reference_capital is not None:
+                run_state["reference_capital"] = self.reference_capital
+
             agents_progress["graph_setup"] = "completed"
             emit_progress("graph_setup", 10, "分析图初始化完成")
 
@@ -426,6 +447,11 @@ class AnalysisRunner:
             result["final_state"] = self._build_slim_final_state(final_state)
             result["signal"] = signal
             result.update(self._extract_structured_metrics(final_state, signal))
+            # Promote structured_decision to top-level for easy UI/API access
+            if isinstance(result.get("final_state"), dict):
+                sd = result["final_state"].get("structured_decision")
+                if sd:
+                    result["structured_decision"] = sd
             price = self._get_current_price()
             result["price"] = price if price is not None else None
             result["progress_pct"] = 100
@@ -705,6 +731,21 @@ class AnalysisRunner:
         persona_signals = serialized.get("persona_signals")
         if isinstance(persona_signals, dict) and persona_signals:
             slim_state["persona_signals"] = persona_signals
+
+        # Parse structured decision from final_trade_decision
+        ftd = slim_state.get("final_trade_decision")
+        if isinstance(ftd, str) and ftd:
+            from webapi.utils.decision_parser import parse_structured_decision
+
+            parsed = parse_structured_decision(ftd)
+            if parsed and any(v is not None for v in parsed.values()):
+                slim_state["structured_decision"] = parsed
+
+                # Strip the JSON code block from the displayed text
+                cleaned = re.sub(r'\n?```json\s*\n?.*?\n?\s*```\s*$', '', ftd, flags=re.DOTALL)
+                cleaned = cleaned.rstrip()
+                if cleaned:  # Only replace if there's text left after stripping
+                    slim_state["final_trade_decision"] = cleaned
 
         return slim_state
 

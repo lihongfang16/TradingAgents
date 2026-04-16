@@ -31,7 +31,7 @@ from typing import Any, Dict, Optional
 from tradingagents.core.analysis_runner import AnalysisRunner
 from webapi.config.database import SessionLocal
 from webapi.models.analysis import AnalysisRequest, AnalysisStatus, StockExchange
-from webapi.models.database import AnalysisTask
+from webapi.models.database import AnalysisTask, Watchlist
 from webapi.services.queue_service import AnalysisQueueService
 from webapi.utils.signal_extractor import normalize_signal
 
@@ -264,6 +264,20 @@ def _update_progress(task_id: str, data: Dict[str, Any]) -> None:
         db.close()
 
 
+def _update_position_context(task_id: str, position_context: Dict[str, Any]) -> None:
+    """Persist position context on the analysis task for traceability."""
+    db = SessionLocal()
+    try:
+        task = db.query(AnalysisTask).filter(AnalysisTask.task_id == task_id).first()
+        if task is not None:
+            task.position_context = position_context
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entrypoint used by AnalysisService subprocess launches."""
     args = list(argv if argv is not None else sys.argv[1:])
@@ -297,6 +311,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             message=f"Analysis running for {request.symbol}",
         )
 
+        # Look up watchlist position context for this symbol
+        cost_price = None
+        position_shares = None
+        target_position_pct = None
+        reference_capital = None
+        try:
+            db = SessionLocal()
+            try:
+                watchlist = db.query(Watchlist).filter(
+                    Watchlist.symbol == request.symbol,
+                    Watchlist.is_active == 'Y'
+                ).first()
+                if watchlist and watchlist.cost_price:
+                    cost_price = float(watchlist.cost_price)
+                    position_shares = int(watchlist.position_shares) if watchlist.position_shares else None
+                    target_position_pct = float(watchlist.target_position_pct) if watchlist.target_position_pct else None
+                    reference_capital = float(watchlist.reference_capital) if watchlist.reference_capital else None
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Could not load watchlist position context for {request.symbol}: {e}")
+
         runner = AnalysisRunner(
             symbol=request.symbol,
             date=request.date or datetime.utcnow().strftime("%Y-%m-%d"),
@@ -308,7 +344,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             progress_callback=lambda data: _update_progress(task_id, data),
             max_iterations=300,
             fast_mode=request.is_quick,
+            cost_price=cost_price,
+            position_shares=position_shares,
+            target_position_pct=target_position_pct,
+            reference_capital=reference_capital,
         )
+
+        # Persist position context on the task for traceability
+        if cost_price is not None:
+            _update_position_context(task_id, {
+                "cost_price": cost_price,
+                "position_shares": position_shares,
+                "target_position_pct": target_position_pct,
+                "reference_capital": reference_capital,
+            })
         result = runner.run()
         result["analysis_type"] = "quick" if request.is_quick else result.get("analysis_type", "full")
 

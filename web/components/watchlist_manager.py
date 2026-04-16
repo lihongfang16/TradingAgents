@@ -1801,7 +1801,10 @@ def render_watchlist_table():
             # Line 2: signal
             signal_text = format_signal(last_signal, last_confidence)
             next_text = get_next_analysis_text(is_high_freq, high_freq_until, item.get('last_analysis_at'))
-            st.markdown(f"<small>{signal_text} | {next_text}</small>", unsafe_allow_html=True)
+            line2_parts = [signal_text, next_text]
+            if item.get('cost_price'):
+                line2_parts.append('<span style="color:#999;">💰 已设持仓</span>')
+            st.markdown(f"<small>{' | '.join(line2_parts)}</small>", unsafe_allow_html=True)
             
             # Line 3: buttons
             _sym_status = status_batch.get(symbol, {})
@@ -2273,6 +2276,44 @@ def render_stock_detail_modal():
                 turning_enabled = item.get('turning_detection_enabled', True)
                 st.write(f"变盘检测: {'✅' if turning_enabled else '❌'}")
             
+            # Position info section
+            cost_price = item.get('cost_price')
+            position_shares = item.get('position_shares')
+            target_position_pct = item.get('target_position_pct')
+            reference_capital = item.get('reference_capital')
+            last_price = item.get('last_price')
+
+            if cost_price or position_shares:
+                st.write("---")
+                st.write("**📊 持仓信息**")
+                pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
+                with pos_col1:
+                    st.metric("持仓成本", f"¥{cost_price:.2f}" if cost_price else "未设置")
+                with pos_col2:
+                    st.metric("持仓数量", f"{position_shares:,} 股" if position_shares else "未设置")
+                with pos_col3:
+                    # Computed current position ratio
+                    if reference_capital and reference_capital > 0 and position_shares and last_price:
+                        current_pct = (position_shares * last_price) / reference_capital * 100
+                        st.metric("当前仓位", f"{current_pct:.1f}%")
+                    else:
+                        st.metric("当前仓位", "未设置")
+                with pos_col4:
+                    pct_display = f"{target_position_pct * 100:.0f}%" if target_position_pct else "未设置"
+                    st.metric("目标仓位", pct_display)
+                
+                # Show position gap analysis
+                if reference_capital and reference_capital > 0 and position_shares and last_price and target_position_pct:
+                    current_pct = (position_shares * last_price) / reference_capital * 100
+                    target_pct = target_position_pct * 100
+                    diff = target_pct - current_pct
+                    if abs(diff) > 0.5:
+                        direction = "📈 需增持" if diff > 0 else "📉 需减持"
+                        est_shares = int(abs(diff) / 100 * reference_capital / max(last_price, 0.01))
+                        st.info(f"{direction}约 {abs(diff):.1f}% 仓位（约 {est_shares:,} 股）")
+            else:
+                st.caption("💡 未设置持仓信息，可在 ⚙️ 设置中配置成本价和持仓股数")
+            
             # Analysis history with K-line chart
             st.write("**分析历史 & K线信号**")
             watchlist_id = item.get('id')
@@ -2444,6 +2485,69 @@ def render_stock_settings_modal():
             
             st.caption(f"当前阈值: {threshold:.0%} (当置信度变化超过此值时触发变盘信号)")
             
+            # Position information
+            st.write("---")
+            st.write("**持仓信息**")
+            
+            cost_price = st.number_input(
+                "持仓成本价 (¥)",
+                min_value=0.0,
+                max_value=100000.0,
+                value=float(item.get('cost_price') or 0.0),
+                step=0.01,
+                format="%.2f",
+                key=f"setting_cost_price_{stock_id}"
+            )
+            
+            position_shares = st.number_input(
+                "持仓股数",
+                min_value=0,
+                max_value=10000000,
+                value=int(item.get('position_shares') or 0),
+                step=100,
+                format="%d",
+                key=f"setting_position_shares_{stock_id}"
+            )
+            
+            target_position_pct = st.number_input(
+                "目标仓位比例 (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float((item.get('target_position_pct') or 0.0) * 100),
+                step=1.0,
+                format="%.0f",
+                key=f"setting_target_pct_{stock_id}"
+            )
+            
+            reference_capital = st.number_input(
+                "参考本金 (¥)",
+                min_value=0.0,
+                max_value=100000000.0,
+                value=float(item.get('reference_capital') or 0.0),
+                step=1000.0,
+                format="%.0f",
+                key=f"setting_reference_capital_{stock_id}"
+            )
+            
+            # Computed: current position ratio
+            if reference_capital > 0 and position_shares > 0:
+                last_price = item.get('last_price') or 0
+                current_pct = (position_shares * last_price) / reference_capital * 100
+                target_pct = target_position_pct  # already in 0-100 range from number_input
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("当前持仓比例", f"{current_pct:.1f}%")
+                with col_b:
+                    st.metric("目标仓位比例", f"{target_pct:.0f}%")
+                
+                diff = target_pct - current_pct
+                if abs(diff) > 0.5:
+                    direction = "需增持" if diff > 0 else "需减持"
+                    st.info(f"📊 {direction}约 {abs(diff):.1f}% 仓位（约 {int(abs(diff) / 100 * reference_capital / max(last_price, 0.01))} 股）")
+            elif reference_capital > 0:
+                st.caption("💡 设置持仓股数后可查看当前持仓比例")
+            
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("保存设置", key=f"save_settings_{stock_id}"):
@@ -2454,7 +2558,11 @@ def render_stock_settings_modal():
                             json={
                                 'is_active': is_active,
                                 'turning_detection_enabled': turning_enabled,
-                                'confidence_jump_threshold': threshold
+                                'confidence_jump_threshold': threshold,
+                                'cost_price': cost_price if cost_price > 0 else None,
+                                'position_shares': position_shares if position_shares > 0 else None,
+                                'target_position_pct': target_position_pct / 100.0 if target_position_pct > 0 else None,
+                                'reference_capital': reference_capital if reference_capital > 0 else None,
                             },
                             timeout=5
                         )

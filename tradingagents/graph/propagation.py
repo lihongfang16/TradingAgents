@@ -54,6 +54,10 @@ class Propagator:
             "market_index_report": "",
             "persona_signals": {},
             "persona_report": "",
+            "cost_price": None,
+            "position_shares": None,
+            "target_position_pct": None,
+            "reference_capital": None,
         }
 
     def get_graph_args(self, callbacks: Optional[List] = None, stream_mode: str = "values", version: Optional[str] = None) -> Dict[str, Any]:

@@ -1102,6 +1102,37 @@ def render_history_detail(task_id: str):
                 tabs = st.tabs(list(available_reports.values()))
                 for i, (tab, (report_key, report_name)) in enumerate(zip(tabs, available_reports.items())):
                     with tab:
+                        # Structured recommendation card (before final_trade_decision text)
+                        if report_key == "final_trade_decision":
+                            structured = final_state_for_tabs.get("structured_decision", {})
+                            if structured and structured.get("action"):
+                                action = structured.get("action", "")
+                                price_range = structured.get("price_range")
+                                target_shares = structured.get("target_shares")
+                                reason = structured.get("reason")
+
+                                # Only show detailed card for 增持/减持 with specific data
+                                if action in ("OVERWEIGHT", "UNDERWEIGHT") and (price_range or target_shares):
+                                    action_cn = {"OVERWEIGHT": "增持", "UNDERWEIGHT": "减持", "BUY": "买入", "SELL": "卖出", "HOLD": "持有"}.get(action, action)
+                                    action_emoji = "📈" if action == "OVERWEIGHT" else "📉"
+
+                                    st.markdown(f"""
+                                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                                padding: 16px; border-radius: 10px; color: white; margin: 10px 0;">
+                                        <h4 style="margin:0; color: white;">{action_emoji} 建议操作：{action_cn}</h4>
+                                        <div style="display: flex; gap: 20px; margin-top: 8px;">
+                                            {"<span>💰 价格区间：¥" + str(price_range) + "</span>" if price_range else ""}
+                                            {"<span>📊 建议股数：" + str(target_shares) + " 股</span>" if target_shares else ""}
+                                        </div>
+                                        {"<p style='margin: 8px 0 0 0; font-size: 0.9em; opacity: 0.9;'>💡 " + str(reason) + "</p>" if reason else ""}
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                elif action:
+                                    # Simple rating display for non-增持/减持
+                                    action_cn = {"OVERWEIGHT": "增持", "UNDERWEIGHT": "减持", "BUY": "买入", "SELL": "卖出", "HOLD": "持有"}.get(action, action)
+                                    rating_emoji = {"BUY": "🟢", "OVERWEIGHT": "📈", "HOLD": "🟡", "UNDERWEIGHT": "📉", "SELL": "🔴"}.get(action, "⚪")
+                                    st.info(f"{rating_emoji} **综合评级：{action_cn}**")
+
                         st.markdown(final_state_for_tabs[report_key])
 
         # Show LLM agent outputs if available (post-analysis review)

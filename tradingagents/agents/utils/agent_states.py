@@ -82,3 +82,9 @@ class AgentState(MessagesState):
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+
+    # position context (from watchlist)
+    cost_price: Annotated[Optional[float], "User's average cost price for existing position"]
+    position_shares: Annotated[Optional[int], "Number of shares currently held"]
+    target_position_pct: Annotated[Optional[float], "Target allocation percentage relative to reference principal"]
+    reference_capital: Annotated[Optional[float], "User's total investable capital for position ratio calculation"]

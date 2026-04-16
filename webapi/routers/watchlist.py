@@ -111,6 +111,10 @@ class WatchlistUpdate(BaseModel):
     is_active: Optional[bool] = None
     turning_detection_enabled: Optional[bool] = None
     confidence_jump_threshold: Optional[float] = None
+    cost_price: Optional[float] = None
+    position_shares: Optional[int] = None
+    target_position_pct: Optional[float] = None
+    reference_capital: Optional[float] = None
 
 
 class WatchlistResponse(BaseModel):
@@ -131,6 +135,10 @@ class WatchlistResponse(BaseModel):
     high_freq_until: Optional[str] = None
     last_price: Optional[float] = None
     last_change_pct: Optional[float] = None
+    cost_price: Optional[float] = None
+    position_shares: Optional[int] = None
+    target_position_pct: Optional[float] = None
+    reference_capital: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -313,6 +321,10 @@ def _watchlist_to_response(w: Watchlist) -> WatchlistResponse:
         high_freq_until=w.high_freq_until.isoformat() if w.high_freq_until else None,
         last_price=float(w.last_price) if w.last_price else None,
         last_change_pct=float(w.last_change_pct) if w.last_change_pct else None,
+        cost_price=float(w.cost_price) if w.cost_price else None,
+        position_shares=int(w.position_shares) if w.position_shares else None,
+        target_position_pct=float(w.target_position_pct) if w.target_position_pct else None,
+        reference_capital=float(w.reference_capital) if w.reference_capital else None,
     )
 
 
@@ -717,6 +729,14 @@ async def update_watchlist(
         watchlist.turning_detection_enabled = 'Y' if request.turning_detection_enabled else 'N'
     if request.confidence_jump_threshold is not None:
         watchlist.confidence_jump_threshold = str(request.confidence_jump_threshold)
+    if request.cost_price is not None:
+        watchlist.cost_price = str(request.cost_price)
+    if request.position_shares is not None:
+        watchlist.position_shares = str(request.position_shares)
+    if request.target_position_pct is not None:
+        watchlist.target_position_pct = str(request.target_position_pct)
+    if request.reference_capital is not None:
+        watchlist.reference_capital = str(request.reference_capital)
 
     db.commit()
     db.refresh(watchlist)

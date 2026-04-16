@@ -33,7 +33,7 @@ class AnalysisTask(Base):
     result = Column(JSONB, nullable=True)
     
     # Extracted fields for querying
-    decision = Column(String(10), nullable=True)  # BUY, SELL, HOLD, UNKNOWN
+    decision = Column(String(20), nullable=True)  # BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL, UNKNOWN
     confidence = Column(Integer, nullable=True)
     
     # Messages
@@ -46,6 +46,7 @@ class AnalysisTask(Base):
     progress_pct = Column(Integer, nullable=True, default=0)
     logs = Column(JSONB, nullable=True, default=list)
     llm_streams = Column(JSONB, nullable=True)  # Per-agent LLM output text
+    position_context = Column(JSONB, nullable=True)  # Watchlist position data injected into analysis
 
     # Table configuration
     __table_args__ = (
@@ -72,6 +73,7 @@ class AnalysisTask(Base):
             'progress_pct': self.progress_pct,
             'logs': self.logs,
             'llm_streams': self.llm_streams,
+            'position_context': self.position_context,
         }
     
     @classmethod
@@ -94,6 +96,7 @@ class AnalysisTask(Base):
             progress_pct=data.get('progress_pct'),
             logs=data.get('logs'),
             llm_streams=data.get('llm_streams'),
+            position_context=data.get('position_context'),
         )
     
     @classmethod
@@ -128,6 +131,7 @@ class AnalysisTask(Base):
             progress_pct=getattr(response, 'progress_pct', None),
             logs=getattr(response, 'logs', None),
             llm_streams=getattr(response, 'llm_streams', None),
+            position_context=getattr(response, 'position_context', None),
         )
 
 
@@ -296,7 +300,11 @@ class Watchlist(Base):
     high_freq_until = Column(DateTime, nullable=True)
     last_price = Column(String(20), nullable=True)
     last_change_pct = Column(String(10), nullable=True)
-    
+    cost_price = Column(String(20), nullable=True)
+    position_shares = Column(String(20), nullable=True)
+    target_position_pct = Column(String(20), nullable=True)
+    reference_capital = Column(String(20), nullable=True)
+
     # Table configuration
     __table_args__ = (
         Index('idx_watchlist_symbol_active', 'symbol', 'is_active'),
@@ -322,6 +330,10 @@ class Watchlist(Base):
             'high_freq_until': self.high_freq_until.isoformat() if self.high_freq_until else None,
             'last_price': float(self.last_price) if self.last_price else None,
             'last_change_pct': float(self.last_change_pct) if self.last_change_pct else None,
+            'cost_price': float(self.cost_price) if self.cost_price else None,
+            'position_shares': int(self.position_shares) if self.position_shares else None,
+            'target_position_pct': float(self.target_position_pct) if self.target_position_pct else None,
+            'reference_capital': float(self.reference_capital) if self.reference_capital else None,
         }
     
     @classmethod
@@ -344,6 +356,10 @@ class Watchlist(Base):
             high_freq_until=datetime.fromisoformat(data['high_freq_until']) if data.get('high_freq_until') else None,
             last_price=str(data['last_price']) if data.get('last_price') is not None else None,
             last_change_pct=str(data['last_change_pct']) if data.get('last_change_pct') is not None else None,
+            cost_price=str(data['cost_price']) if data.get('cost_price') is not None else None,
+            position_shares=str(data['position_shares']) if data.get('position_shares') is not None else None,
+            target_position_pct=str(data['target_position_pct']) if data.get('target_position_pct') is not None else None,
+            reference_capital=str(data['reference_capital']) if data.get('reference_capital') is not None else None,
         )
 
 

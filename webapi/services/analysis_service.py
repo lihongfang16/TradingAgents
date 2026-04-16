@@ -119,6 +119,7 @@ def _orm_to_response(task: AnalysisTask) -> AnalysisResponse:
         llm_streams=task.llm_streams,
         decision=task.decision,
         confidence=task.confidence,
+        position_context=task.position_context,
     )
 
 
@@ -586,6 +587,25 @@ class AnalysisService:
 
         request = self._apply_request_mode(request, is_quick=is_quick)
         runner_config = _resolve_runner_config(request)
+
+        # Look up watchlist position context
+        cost_price = None
+        position_shares = None
+        target_position_pct = None
+        try:
+            from webapi.models.database import Watchlist as _WL
+            _db = SessionLocal()
+            try:
+                _wl = _db.query(_WL).filter(_WL.symbol == request.symbol, _WL.is_active == 'Y').first()
+                if _wl and _wl.cost_price:
+                    cost_price = float(_wl.cost_price)
+                    position_shares = int(_wl.position_shares) if _wl.position_shares else None
+                    target_position_pct = float(_wl.target_position_pct) if _wl.target_position_pct else None
+            finally:
+                _db.close()
+        except Exception:
+            pass  # Non-critical — analysis works without position context
+
         runner = AnalysisRunner(
             symbol=request.symbol,
             date=request.date or datetime.utcnow().strftime("%Y-%m-%d"),
@@ -596,6 +616,9 @@ class AnalysisService:
             api_key=runner_config["api_key"],
             max_iterations=300,
             fast_mode=request.is_quick,
+            cost_price=cost_price,
+            position_shares=position_shares,
+            target_position_pct=target_position_pct,
         )
         result = runner.run()
         result["analysis_type"] = "quick" if request.is_quick else result.get("analysis_type", "full")

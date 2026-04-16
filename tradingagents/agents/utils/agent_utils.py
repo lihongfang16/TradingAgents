@@ -42,6 +42,33 @@ def build_instrument_context(ticker: str) -> str:
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`)."
     )
 
+
+def build_full_context(ticker: str, state: dict[str, object]) -> str:
+    """Build instrument context enriched with the Market Index Analyst macro report.
+
+    Wraps :func:`build_instrument_context` and, when available, appends the
+    ``market_index_report`` produced by the Market Index Analyst so downstream
+    analysts can reference macro environment context.
+
+    Args:
+        ticker: The stock ticker / instrument identifier.
+        state:  The current :class:`AgentState` dict.
+
+    Returns:
+        The base instrument context string, optionally suffixed with the macro
+        environment summary.
+    """
+    context = build_instrument_context(ticker)
+    macro_report = state.get("market_index_report")
+    if macro_report:
+        context += (
+            "\n\n## 大盘与板块环境概要\n"
+            "以下是 Market Index Analyst 提供的宏观环境分析，"
+            "请在你的分析中参考这些宏观背景：\n\n"
+            f"{macro_report}"
+        )
+    return context
+
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add placeholder for Anthropic compatibility"""
