@@ -103,6 +103,10 @@ def _resolve_runner_config(request: AnalysisRequest) -> Dict[str, Optional[str]]
         api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("OPENAI_API_KEY")
         llm_provider = "openai"
 
+    if llm_provider.lower() == "kimi":
+        base_url = os.getenv("KIMI_BASE_URL") or os.getenv("MOONSHOT_API_BASE") or "https://api.moonshot.cn/v1"
+        api_key = os.getenv("MOONSHOT_API_KEY") or os.getenv("KIMI_API_KEY")
+
     return {
         "llm_provider": llm_provider,
         "llm_model": deep_model,

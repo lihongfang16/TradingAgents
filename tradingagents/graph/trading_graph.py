@@ -176,6 +176,11 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        elif provider == "kimi":
+            kimi_thinking_type = self.config.get("kimi_thinking_type")
+            if kimi_thinking_type:
+                kwargs["kimi_thinking_type"] = kimi_thinking_type
+
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:

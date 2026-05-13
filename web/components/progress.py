@@ -122,11 +122,13 @@ def render_results(task: Dict[str, Any]) -> None:
     confidence = signal.get("confidence", 0.0)
     risk_score = signal.get("risk_score", 0.0)
     
-    # Decision badge with color
+    # Decision badge with color (5-tier rating support)
     decision_colors = {
         "BUY": "🟢",
-        "SELL": "🔴",
-        "HOLD": "🟡"
+        "OVERWEIGHT": "🟢",
+        "HOLD": "🟡",
+        "UNDERWEIGHT": "🔴",
+        "SELL": "🔴"
     }
     decision_icon = decision_colors.get(decision, "⚪")
     

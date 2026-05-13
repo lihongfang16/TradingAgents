@@ -1,6 +1,6 @@
 """PostgreSQL-backed queue operations for analysis workers."""
 
-# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportGeneralTypeIssues=false, reportMissingTypeArgument=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportDeprecated=false, reportReturnType=false
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false, reportGeneralTypeIssues=false, reportMissingTypeArgument=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportAny=false, reportExplicitAny=false, reportUnusedCallResult=false, reportDeprecated=false, reportReturnType=false, reportCallIssue=false
 
 import logging
 from datetime import datetime, timedelta
@@ -141,29 +141,63 @@ class AnalysisQueueService:
             error_message=message,
         )
 
-    def requeue_failed(self, *, max_retries: Optional[int] = None, stale_timeout_minutes: int = 30) -> int:
-        """Requeue failed tasks and stale processing tasks that are still retryable."""
+    def requeue_failed(
+        self,
+        *,
+        max_retries: Optional[int] = None,
+        stale_timeout_minutes: int = 30,
+        error_types: Optional[list[str]] = None,
+    ) -> int:
+        """Requeue failed tasks and stale processing tasks that are still retryable.
+        
+        Args:
+            max_retries: Maximum retry count limit (None = use task's max_retries)
+            stale_timeout_minutes: How old a PROCESSING task must be to be considered stale
+            error_types: Optional list of error types to filter (e.g., ['llm_timeout']).
+                        If provided, only FAILED tasks with matching error type are requeued.
+                        If None, all FAILED tasks are requeued.
+        
+        Returns:
+            Number of tasks requeued
+        """
         db = SessionLocal()
         try:
             retry_limit_expr = "COALESCE(:max_retries, max_retries)"
             stale_cutoff = datetime.utcnow() - timedelta(minutes=stale_timeout_minutes)
+            
+            # Build error type filter if specified
+            if error_types:
+                # Use PostgreSQL JSON operator to filter by error type
+                # We need to join with analysis_tasks to check error type
+                type_placeholders = ", ".join([f":type_{i}" for i in range(len(error_types))])
+                error_type_filter = f"""
+                    AND task_id IN (
+                        SELECT task_id FROM analysis_tasks
+                        WHERE error::jsonb->>'type' IN ({type_placeholders})
+                    )
+                """
+                error_params = {f"type_{i}": et for i, et in enumerate(error_types)}
+            else:
+                error_type_filter = ""
+                error_params = {}
 
-            failed_result = db.execute(
-                text(
-                    f"""
-                    UPDATE analysis_queue
-                    SET status = 'QUEUED',
-                        retry_count = retry_count + 1,
-                        worker_id = NULL,
-                        started_at = NULL,
-                        completed_at = NULL,
-                        error_message = NULL
-                    WHERE status = 'FAILED'
-                      AND retry_count < {retry_limit_expr};
-                    """
-                ),
-                {"max_retries": max_retries},
-            )
+            failed_query = f"""
+                UPDATE analysis_queue
+                SET status = 'QUEUED',
+                    retry_count = retry_count + 1,
+                    worker_id = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    error_message = NULL
+                WHERE status = 'FAILED'
+                  AND retry_count < {retry_limit_expr}
+                  {error_type_filter}
+            """
+            
+            failed_params = {"max_retries": max_retries}
+            failed_params.update(error_params)
+            
+            failed_result = db.connection().execute(text(failed_query), failed_params)
 
             stale_result = db.execute(
                 text(

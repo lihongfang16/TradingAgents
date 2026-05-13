@@ -4,9 +4,9 @@ Queue monitoring API endpoints.
 Provides endpoints for monitoring the analysis task queue,
 including statistics, retry functionality, and health checks.
 """
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from webapi.services.queue_service import AnalysisQueueService
@@ -59,16 +59,33 @@ async def get_queue_stats() -> Dict[str, Any]:
 
 
 @router.post("/retry-failed", response_model=RetryFailedResponse)
-async def retry_failed_tasks() -> Dict[str, int]:
+async def retry_failed_tasks(
+    error_types: Optional[List[str]] = Query(
+        None,
+        description="Optional list of error types to filter by (e.g., 'llm_timeout', 'api_error'). If provided, only tasks with matching error types will be requeued. If omitted, all failed tasks are requeued."
+    )
+) -> Dict[str, int]:
     """
-    Retry all failed tasks that haven't exceeded max retries.
+    Retry failed tasks that haven't exceeded max retries.
+    
+    Optionally filter by error type to selectively requeue only specific errors
+    (e.g., only 'llm_timeout' errors for retry, leaving 'api_error' tasks as failed).
     
     Also resets stale PROCESSING tasks (tasks stuck for >30 minutes).
     
-    Returns the number of tasks requeued.
+    Args:
+        error_types: Optional list of error type strings to filter by.
+                    Common values: 'llm_timeout', 'api_error', 'data_error', 'unknown'
+    
+    Returns:
+        requeued: Number of tasks requeued
     """
     service = AnalysisQueueService()
-    count = service.requeue_failed(max_retries=3, stale_timeout_minutes=30)
+    count = service.requeue_failed(
+        max_retries=3,
+        stale_timeout_minutes=30,
+        error_types=error_types
+    )
     
     return {"requeued": count}
 

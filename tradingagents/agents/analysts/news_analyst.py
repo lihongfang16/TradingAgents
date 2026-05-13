@@ -1,7 +1,9 @@
 import logging
+from typing import Annotated
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 from tradingagents.agents.utils.agent_utils import (
-    build_instrument_context,
+    build_full_context,
     get_global_news,
     get_language_instruction,
     get_news,
@@ -110,7 +112,7 @@ def create_news_analyst(llm):
 
         current_date = state["trade_date"]
         symbol = state["company_of_interest"]
-        instrument_context = build_instrument_context(symbol)
+        instrument_context = build_full_context(symbol, state)
         a_share = is_a_share(symbol)
 
         if a_share:

@@ -175,6 +175,15 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Custom model ID", "custom"),
         ],
     },
+    "kimi": {
+        "quick": [
+            ("Kimi K2.5 - Fast with reasoning support", "kimi-k2.5"),
+        ],
+        "deep": [
+            ("Kimi K2 Thinking - Deep reasoning, always thinking", "kimi-k2-thinking"),
+            ("Kimi K2.5 - Fast with reasoning support", "kimi-k2.5"),
+        ],
+    },
 }
 
 
