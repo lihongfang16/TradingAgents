@@ -1,9 +1,7 @@
-from langchain_core.messages import AIMessage
-import time
-import json
+from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
-def create_bull_researcher(llm, memory):
+def create_bull_researcher(llm):
     def bull_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -16,14 +14,7 @@ def create_bull_researcher(llm, memory):
         fundamentals_report = state["fundamentals_report"]
         persona_report = state.get("persona_report", "")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
-
-        prompt = f"""你是一位看涨分析师，倡导投资该股票。你的任务是构建一个强有力的、基于证据的看涨观点，强调增长潜力、竞争优势和积极市场指标。利用提供的研究和数据，有效解决看空观点并反驳看空论点。
+        prompt = f"""You are a Bull Analyst advocating for investing in the stock. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively.
 
 需要重点关注的关键点：
 - 增长潜力：突出公司的市场机会、收入预测和可扩展性。
@@ -32,17 +23,15 @@ def create_bull_researcher(llm, memory):
 - 看空观点反驳：用具体数据和合理推理批判性分析看空论点，彻底解决担忧，表明为什么看涨观点具有更强说服力。
 - 互动：以一种对话风格呈现你的论点，直接与看空分析师的观点互动，进行有效辩论，而不仅仅是罗列数据。
 
-可用的资源：
-市场研究报告：{market_research_report}
-社交媒体情绪报告：{sentiment_report}
-最新国际新闻：{news_report}
-公司基本面报告：{fundamentals_report}
-{f"投资者人设投票报告：{persona_report}" if persona_report else ""}
-辩论对话历史：{history}
-看空方最后论点：{current_response}
-类似情况的反思和经验教训：{past_memory_str}
-利用这些信息提供令人信服的看涨论点，反驳看空担忧，并参与展示看涨立场优势的动态辩论。你还必须回应反思内容，从过去的教训和错误中学习。
-"""
+Resources available:
+Market research report: {market_research_report}
+Social media sentiment report: {sentiment_report}
+Latest world affairs news: {news_report}
+Company fundamentals report: {fundamentals_report}
+Conversation history of the debate: {history}
+Last bear argument: {current_response}
+Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position.
+""" + get_language_instruction()
 
         response = llm.invoke(prompt)
 

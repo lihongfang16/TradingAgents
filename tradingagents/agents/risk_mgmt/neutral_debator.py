@@ -1,5 +1,4 @@
-import time
-import json
+from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
 def create_neutral_debator(llm):
@@ -30,7 +29,7 @@ def create_neutral_debator(llm):
 公司基本面报告：{fundamentals_report}
 当前对话历史：{history} 激进派分析师的最后回应：{current_aggressive_response} 保守派分析师的最后回应：{current_conservative_response}。如果其他观点还没有回应，根据可用数据提出你自己的论点。
 
-通过批判性地分析双方来积极参与，回应当激进派和保守派论点中的弱点，倡导更平衡的方法。挑战他们的每一个观点，以说明为什么中等风险策略可能提供两全其美的方案，在提供增长潜力的同时防范极端波动。专注于辩论而不是简单地呈现数据，目标是展示平衡的观点可以带来最可靠的结果。以对话方式进行输出，就像在说话一样，不要使用任何特殊格式。"""
+Engage actively by analyzing both sides critically, addressing weaknesses in the aggressive and conservative arguments to advocate for a more balanced approach. Challenge each of their points to illustrate why a moderate risk strategy might offer the best of both worlds, providing growth potential while safeguarding against extreme volatility. Focus on debating rather than simply presenting data, aiming to show that a balanced view can lead to the most reliable outcomes. Output conversationally as if you are speaking without any special formatting.""" + get_language_instruction()
 
         response = llm.invoke(prompt)
 

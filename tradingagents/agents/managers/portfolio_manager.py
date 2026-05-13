@@ -1,30 +1,43 @@
-from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction
+"""Portfolio Manager: synthesises the risk-analyst debate into the final decision.
+
+Uses LangChain's ``with_structured_output`` so the LLM produces a typed
+``PortfolioDecision`` directly, in a single call.  The result is rendered
+back to markdown for storage in ``final_trade_decision`` so memory log,
+CLI display, and saved reports continue to consume the same shape they do
+today.  When a provider does not expose structured output, the agent falls
+back gracefully to free-text generation.
+"""
+
+from __future__ import annotations
+
+from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+from tradingagents.agents.utils.agent_utils import (
+    build_instrument_context,
+    get_language_instruction,
+)
+from tradingagents.agents.utils.structured import (
+    bind_structured,
+    invoke_structured_or_freetext,
+)
 
 
-def create_portfolio_manager(llm, memory):
+def create_portfolio_manager(llm):
+    structured_llm = bind_structured(llm, PortfolioDecision, "Portfolio Manager")
+
     def portfolio_manager_node(state) -> dict:
-
         instrument_context = build_instrument_context(state["company_of_interest"])
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
-        market_research_report = state["market_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
-        sentiment_report = state["sentiment_report"]
-        trader_plan = state["investment_plan"]
+        research_plan = state["investment_plan"]
+        trader_plan = state["trader_investment_plan"]
 
-        cost_price = state.get("cost_price")
-        position_shares = state.get("position_shares")
-        target_position_pct = state.get("target_position_pct")
-        reference_capital = state.get("reference_capital")
-
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+        past_context = state.get("past_context", "")
+        lessons_line = (
+            f"- Lessons from prior decisions and outcomes:\n{past_context}\n"
+            if past_context
+            else ""
+        )
 
         position_section = ""
         if cost_price is not None and position_shares is not None:
@@ -75,28 +88,27 @@ def create_portfolio_manager(llm, memory):
 - **减持（Underweight）**：减少敞口，获取部分利润
 - **卖出（Sell）**：退出仓位或避免入场
 
-**背景：**
-- 交易员提出的计划：**{trader_plan}**
-- 过去决策的经验教训：**{past_memory_str}**
-{position_section}
-**必需输出结构：**
-1. **评级**：明确给出买入/增持/持有/减持/卖出之一。
-2. **执行摘要**：涵盖入场策略、仓位规模、关键风险水平和时间范围的简洁行动计划。
-3. **投资论点**：基于分析师辩论和过去反思的详细推理。
-
----
-
-**风险分析师辩论历史：**
+**Context:**
+- Research Manager's investment plan: **{research_plan}**
+- Trader's transaction proposal: **{trader_plan}**
+{lessons_line}
+**Risk Analysts Debate History:**
 {history}
 
 ---
 
 要果断，每个结论都要基于分析师的具体证据。{get_language_instruction()}"""
 
-        response = llm.invoke(prompt)
+        final_trade_decision = invoke_structured_or_freetext(
+            structured_llm,
+            llm,
+            prompt,
+            render_pm_decision,
+            "Portfolio Manager",
+        )
 
         new_risk_debate_state = {
-            "judge_decision": response.content,
+            "judge_decision": final_trade_decision,
             "history": risk_debate_state["history"],
             "aggressive_history": risk_debate_state["aggressive_history"],
             "conservative_history": risk_debate_state["conservative_history"],
@@ -110,7 +122,7 @@ def create_portfolio_manager(llm, memory):
 
         return {
             "risk_debate_state": new_risk_debate_state,
-            "final_trade_decision": response.content,
+            "final_trade_decision": final_trade_decision,
         }
 
     return portfolio_manager_node

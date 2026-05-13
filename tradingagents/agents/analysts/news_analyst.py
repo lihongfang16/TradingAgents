@@ -1,7 +1,5 @@
 import logging
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import tool
-from typing import Annotated
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_global_news,

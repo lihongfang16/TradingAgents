@@ -1,6 +1,4 @@
-from langchain_core.messages import AIMessage
-import time
-import json
+from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
 def create_conservative_debator(llm):
@@ -31,7 +29,7 @@ def create_conservative_debator(llm):
 公司基本面报告：{fundamentals_report}
 当前对话历史：{history} 激进派分析师的最后回应：{current_aggressive_response} 中立派分析师的最后回应：{current_neutral_response}。如果其他观点还没有回应，根据可用数据提出你自己的论点。
 
-通过质疑他们的乐观态度并强调他们可能忽视的潜在缺点来参与互动。回应他们的每一个反驳观点，以展示为什么保守立场最终是公司资产最安全的路径。专注于辩论和批评他们的论点，以证明低风险策略优于他们方法的优势。以对话方式进行输出，就像在说话一样，不要使用任何特殊格式。"""
+Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches. Output conversationally as if you are speaking without any special formatting.""" + get_language_instruction()
 
         response = llm.invoke(prompt)
 

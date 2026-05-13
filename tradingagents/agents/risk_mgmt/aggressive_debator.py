@@ -1,5 +1,4 @@
-import time
-import json
+from tradingagents.agents.utils.agent_utils import get_language_instruction
 
 
 def create_aggressive_debator(llm):
@@ -30,7 +29,7 @@ def create_aggressive_debator(llm):
 公司基本面报告：{fundamentals_report}
 当前对话历史：{history} 保守派分析师的最后论点：{current_conservative_response} 中立派分析师的最后论点：{current_neutral_response}。如果其他观点还没有回应，根据可用数据提出你自己的论点。
 
-积极参与，回应当前提出的任何具体担忧，反驳其逻辑中的弱点，并断言冒险以超越市场规范的好处。专注于辩论和说服，而不仅仅是呈现数据。挑战每一个反驳观点，以强调为什么高风险方法是最优的。输出时以对话方式进行，就像在说话一样，不要使用任何特殊格式。"""
+Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal. Output conversationally as if you are speaking without any special formatting.""" + get_language_instruction()
 
         response = llm.invoke(prompt)
 
