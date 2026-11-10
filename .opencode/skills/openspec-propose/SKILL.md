@@ -7,7 +7,7 @@ compatibility: Requires openspec CLI.
 metadata:
   author: openspec
   version: "1.0"
-  generatedBy: "1.15.0"
+  generatedBy: "1.17.0"
 ---
 
 Propose a new change - create the change and generate all artifacts in one step.
@@ -153,7 +153,7 @@ After completing all artifacts, summarize:
 - Change name and location
 - List of artifacts created with brief descriptions, plus any conditional artifact you skipped and why
 - What's ready: "All artifacts needed for implementation are ready."
-- Prompt: "The artifacts are ready for review. When you are ready, run `/opsx-apply` or ask me to apply this change."
+- Prompt: "The artifacts are ready for review. When you are ready, run `/openspec-apply-change` or ask me to apply this change."
 
 **Artifact Creation Guidelines**
 
